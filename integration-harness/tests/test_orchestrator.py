@@ -1,7 +1,9 @@
 import pytest
 import hashlib
 import json
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from integration_harness.orchestrator import (
     Orchestrator,
@@ -51,6 +53,24 @@ def test_heartbeat_does_not_restart_when_status_message_is_missing():
     response = {"data": {"code": -20, "message": "心跳间隔过短"}}
 
     assert Orchestrator._heartbeat_needs_restart(response) is False
+
+
+def test_update_interval_too_short_message_is_detected():
+    assert Orchestrator._is_update_interval_too_short("更新间隔太短，请稍后再试") is True
+    assert Orchestrator._is_update_interval_too_short("SUCCESS") is False
+
+
+def test_coerce_data_handles_string_and_missing_data():
+    assert Orchestrator._coerce_data({"data": "unexpected"}) == {}
+    assert Orchestrator._coerce_data({"data": {}}) == {}
+    assert Orchestrator._coerce_data({"data": {"code": -20}}) == {"code": -20}
+
+
+def test_coerce_data_logs_warning_for_string_data(caplog):
+    with caplog.at_level(logging.WARNING, logger="integration_harness.orchestrator"):
+        Orchestrator._coerce_data({"data": "unexpected"})
+
+    assert "响应 data 不是对象" in caplog.text
 
 
 def test_select_course_and_doc_skips_when_all_docs_are_finished():
@@ -294,6 +314,130 @@ def test_qr_expires_at_uses_check_end_time():
     )
 
     assert expires_at.timestamp() == 1789454606.189
+
+
+def test_qr_expires_at_ignores_zero_check_end_time():
+    created_at = datetime(2026, 9, 17, 10, 0, 0, tzinfo=timezone.utc)
+    orchestrator = Orchestrator.__new__(Orchestrator)
+
+    expires_at = orchestrator._qr_expires_at(
+        {"checkEndTime": 0, "validity": 300},
+        created_at,
+    )
+
+    assert expires_at.timestamp() == (created_at + timedelta(seconds=300)).timestamp()
+
+
+def test_learned_complete_detection_from_response_data():
+    assert Orchestrator._is_learned_complete({"learnedStatus": 2}) is True
+    assert Orchestrator._is_learned_complete(
+        {"mycourseInfo": {"learnedStatus": 2}}
+    ) is True
+    assert Orchestrator._is_learned_complete({"learnedStatus": 1}) is False
+
+
+def test_get_task_cert_synced_matches_task_id():
+    runner = _poll_runner()
+    runner.id_card = "id-1"
+    runner.name = "张三"
+    runner._post_json = lambda path, payload, event_type: {
+        "data": [
+            {"mytask": {"_id": "task-1", "extra": {"synced": 1}}},
+            {"mytask": {"_id": "task-2", "extra": {"synced": 0}}},
+            {"mytask": {"_id": "task-4", "extra": {}}},
+        ]
+    }
+
+    assert runner._get_task_cert_synced("task-1") == 1
+    assert runner._get_task_cert_synced("task-2") == 0
+    assert runner._get_task_cert_synced("task-3") == 0
+    assert runner._get_task_cert_synced("task-4") == 0
+
+
+def test_get_task_cert_synced_and_watch_target_from_top_level_item():
+    runner = _poll_runner()
+    runner.id_card = "id-1"
+    runner.name = "张三"
+    runner._post_json = lambda path, payload, event_type: {
+        "data": [
+            {
+                "_id": "6a7d1eb50a8d2ffed6ded67c",
+                "taskId": "6a3c8f355c97aa9d1eb5d8e4",
+                "courseList": [
+                    {
+                        "id": "6a3c8f355c97aa9d1eb5d8ee",
+                        "courseIds": ["6a263c6734ccc04a8da48072"],
+                    }
+                ],
+                "learnedStatus": 2,
+                "extra": {
+                    "PUB_02": {"finishSupervision": False},
+                },
+            }
+        ]
+    }
+
+    assert runner._get_task_cert_synced("6a3c8f355c97aa9d1eb5d8e4") == 0
+    assert runner._cert_watch_target("6a3c8f355c97aa9d1eb5d8e4") == (
+        "6a3c8f355c97aa9d1eb5d8ee",
+        "6a263c6734ccc04a8da48072",
+    )
+
+
+def _poll_runner():
+    runner = Orchestrator.__new__(Orchestrator)
+    runner.config = SimpleNamespace(verify_poll_interval_seconds=5)
+    runner.logger = _DummyLogger()
+    runner.notifier = SimpleNamespace(send_markdown=lambda content: True)
+    runner.id_card = "id-1"
+    runner.name = "张三"
+    return runner
+
+
+def test_poll_until_verified_returns_completed():
+    runner = _poll_runner()
+    runner._gd_call = lambda method, **kwargs: {"data": {}}
+    runner._is_task_completed = lambda task_id: True
+    qr_state = SimpleNamespace()
+
+    outcome = runner._poll_until_verified(
+        task_id="task-1",
+        mycourse_id="course-1",
+        study_token="token-1",
+        point_code="point-1",
+        qr_state=qr_state,
+    )
+
+    assert outcome == "completed"
+    assert qr_state.verify_status == "VERIFIED"
+
+
+def test_poll_until_verified_returns_timeout_and_notifies(monkeypatch):
+    runner = _poll_runner()
+    runner._gd_call = lambda method, **kwargs: {"data": {"verifyResult": "0"}}
+    runner._is_task_completed = lambda task_id: False
+    notified = []
+    runner._notify_verification_timeout = lambda **kwargs: notified.append(kwargs)
+    monkeypatch.setattr(
+        "integration_harness.orchestrator.time.monotonic",
+        iter([0, 2000]).__next__,
+    )
+    monkeypatch.setattr(
+        "integration_harness.orchestrator.time.sleep",
+        lambda seconds: None,
+    )
+    qr_state = SimpleNamespace()
+
+    outcome = runner._poll_until_verified(
+        task_id="task-1",
+        mycourse_id="course-1",
+        study_token="token-1",
+        point_code="point-1",
+        qr_state=qr_state,
+    )
+
+    assert outcome == "timeout"
+    assert notified[0]["point_code"] == "point-1"
 
 
 class _FakeOssUploader:

@@ -7,10 +7,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from wechat_login_harvester.oss import OssClient
-from wechat_login_harvester.wechat import WeChatNotifier
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -28,6 +24,11 @@ class CapturedToken:
 
 
 class LoginCaptureAddon:
+    auth_url_markers = (
+        "/index.php/api/user/unbind",
+        "/index.php/api/user/bind",
+    )
+
     def __init__(
         self,
         *,
@@ -44,7 +45,7 @@ class LoginCaptureAddon:
         self.notifier = notifier
 
     def request(self, flow) -> None:  # type: ignore[no-untyped-def]
-        if self.login_url_marker not in flow.request.pretty_url:
+        if not self._is_relevant_auth_url(flow.request.pretty_url):
             return
         self._write_debug(
             {
@@ -55,7 +56,7 @@ class LoginCaptureAddon:
         )
 
     def response(self, flow) -> None:  # type: ignore[no-untyped-def]
-        if self.login_url_marker not in flow.request.pretty_url:
+        if not self._is_relevant_auth_url(flow.request.pretty_url):
             return
         try:
             payload = json.loads(flow.response.get_text())
@@ -70,6 +71,9 @@ class LoginCaptureAddon:
                 "response": payload,
             }
         )
+        self._log_auth_response(flow.request.pretty_url, payload)
+        if self.login_url_marker not in flow.request.pretty_url:
+            return
         login_data = _extract_login_data(payload)
         if not login_data.get("token"):
             return
@@ -81,6 +85,17 @@ class LoginCaptureAddon:
         )
         self._write_captured(captured)
         self._write_account_file(login_data)
+
+    def _is_relevant_auth_url(self, url: str) -> bool:
+        return self.login_url_marker in url or any(
+            marker in url for marker in self.auth_url_markers
+        )
+
+    def _log_auth_response(self, url: str, payload: dict[str, Any]) -> None:
+        if "/api/user/unbind" in url:
+            logger.info("unbind 响应：code=%s msg=%s", payload.get("code"), payload.get("msg"))
+        elif "/api/user/bind" in url:
+            logger.info("bind 响应：code=%s msg=%s", payload.get("code"), payload.get("msg"))
 
     def _write_debug(self, payload: dict[str, Any]) -> None:
         self.token_output_dir.mkdir(parents=True, exist_ok=True)
@@ -123,8 +138,6 @@ class LoginCaptureAddon:
             json.dumps(account_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        self._upload_account_file(path, id_card)
-        self._upload_account_manifest(login_data, id_card)
 
     def _upload_account_file(self, path: Path, id_card: str) -> None:
         if self.oss_client is None:
@@ -248,36 +261,14 @@ def _build_account_manifest(name: str, id_card: str) -> dict[str, str]:
 
 def _build_addons():
     from wechat_login_harvester.config import load_config
-    from wechat_login_harvester.oss import OssClient
 
     _configure_capture_logging()
     config = load_config()
-    oss_client = None
-    if (
-        config.oss_bucket
-        and config.oss_access_key_id
-        and config.oss_access_key_secret
-        and config.oss_endpoint
-    ):
-        oss_client = OssClient(
-            access_key_id=config.oss_access_key_id,
-            access_key_secret=config.oss_access_key_secret,
-            bucket_name=config.oss_bucket,
-            endpoint=config.oss_endpoint,
-        )
-    notifier = None
-    if config.wecom_webhook_url:
-        notifier = WeChatNotifier(
-            config.wecom_webhook_url,
-            outbox_path=Path.cwd() / "runs" / ".wecom_outbox.jsonl",
-        )
     return [
         LoginCaptureAddon(
             login_url_marker=config.login_url_marker,
             token_output_dir=config.token_output_dir,
             account_dir=config.account_dir,
-            oss_client=oss_client,
-            notifier=notifier,
         )
     ]
 

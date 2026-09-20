@@ -4,8 +4,10 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,7 +32,7 @@ COMPENSATION_LOCK = threading.Lock()
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Real-environment normal-path integration harness")
-    parser.add_argument("command", choices=["run"], help="Command to execute")
+    parser.add_argument("command", choices=["run", "watch"], help="Command to execute")
     parser.add_argument(
         "--account-dir",
         default=os.getenv(
@@ -38,6 +40,11 @@ def build_parser() -> argparse.ArgumentParser:
             "/Users/liuyingying/simon/work/automation/account",
         ),
         help="Directory containing .account JSON files",
+    )
+    parser.add_argument(
+        "--account-file",
+        default=None,
+        help="Run a single .account file",
     )
     parser.add_argument(
         "--compensate",
@@ -328,6 +335,32 @@ def _run_prepared(task: _PreparedAccount) -> int:
             return 1
 
         print(f"OSS success 标记上传成功：{success_key}")
+
+        finished_key = f"{oss_dir}/finished"
+        finished_result = uploader.upload_text(finished_key, "")
+        if not finished_result.success:
+            print(
+                f"OSS finished 标记上传失败 {finished_key}: {finished_result.error}",
+                file=sys.stderr,
+            )
+            notifier.send_exception(
+                app_id=config.app_id,
+                token_prefix=config.token_prefix,
+                device_id=config.device_id,
+                session_id=session_id,
+                exc=RuntimeError(
+                    f"OSS finished 标记上传失败 {finished_key}: {finished_result.error}"
+                ),
+                id_card=account.id_card,
+                name=account.name,
+            )
+            _append_compensation(
+                account,
+                f"OSS finished 标记上传失败 {finished_key}: {finished_result.error}",
+            )
+            return 1
+
+        print(f"OSS finished 标记上传成功：{finished_key}")
         _remove_compensation(account)
         return 0
     except Exception as exc:
@@ -349,6 +382,184 @@ def _run_prepared(task: _PreparedAccount) -> int:
             f"{type(exc).__name__}: {exc}",
         )
         return 1
+    finally:
+        notifier.close()
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _account_file_paths(account_dir: Path) -> set[str]:
+    account_dir = account_dir.expanduser()
+    if not account_dir.exists():
+        return set()
+    return {
+        str(path.resolve())
+        for path in account_dir.glob("*.account")
+        if path.is_file()
+    }
+
+
+def _single_account_command(account_path: Path) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "integration_harness",
+        "run",
+        "--account-file",
+        str(account_path),
+    ]
+
+
+def _token_expired(account_path: Path) -> bool:
+    try:
+        payload = json.loads(account_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return True
+    expires_at = payload.get("tokenExpiresAt")
+    if not isinstance(expires_at, (int, float)):
+        return True
+    return datetime.now().timestamp() >= float(expires_at)
+
+
+def _stop_watched_process(
+    proc: subprocess.Popen,
+    stdout_file,
+    stderr_file,
+) -> None:
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+    stdout_file.close()
+    stderr_file.close()
+
+
+def _watch_accounts(account_dir: Path) -> int:
+    account_dir = account_dir.expanduser()
+    interval = float(os.getenv("ACCOUNT_WATCH_INTERVAL_SECONDS", "2"))
+    config = load_config(
+        {
+            "HXACC_TOKEN": "watch-mode",
+            "HXACC_DEVICE_ID": "watch-mode",
+        }
+    )
+    notifier = WeChatNotifier(
+        config.wecom_webhook_url,
+        outbox_path=config.runs_dir / ".wecom_outbox.jsonl",
+    )
+    uploader = OssAccountUploader(
+        access_key_id=config.oss_access_key_id,
+        access_key_secret=config.oss_access_key_secret,
+        bucket_name=config.oss_bucket,
+        endpoint=config.oss_endpoint,
+    )
+    log_dir = _project_root() / "runs" / "watch"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    watched: dict[str, tuple[subprocess.Popen, object, object]] = {}
+    finished_notified: set[str] = set()
+    expired_notified: set[str] = set()
+    print(f"开始监控 OSS hxacc/account/，本地账户目录 {account_dir}，扫描间隔 {interval}s")
+
+    def stop_all() -> None:
+        for path, (proc, stdout_file, stderr_file) in list(watched.items()):
+            _stop_watched_process(proc, stdout_file, stderr_file)
+            print(f"已停止：{path}")
+        watched.clear()
+
+    def stop_one(id_card: str) -> None:
+        if id_card not in watched:
+            return
+        proc, stdout_file, stderr_file = watched.pop(id_card)
+        _stop_watched_process(proc, stdout_file, stderr_file)
+        print(f"已停止：{id_card}")
+
+    def start_one(id_card: str, account_path: Path) -> None:
+        stdout_path = log_dir / f"{id_card}.out.log"
+        stderr_path = log_dir / f"{id_card}.err.log"
+        stdout_file = stdout_path.open("a", encoding="utf-8")
+        stderr_file = stderr_path.open("a", encoding="utf-8")
+        proc = subprocess.Popen(
+            _single_account_command(account_path),
+            cwd=_project_root(),
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        watched[id_card] = (proc, stdout_file, stderr_file)
+        print(f"已启动：{id_card}")
+
+    try:
+        while True:
+            prefixes = uploader.list_prefixes("hxacc/account/")
+            current_ids = {
+                prefix.rstrip("/").rsplit("/", 1)[-1]
+                for prefix in prefixes
+                if prefix.rstrip("/").startswith("hxacc/account/")
+            }
+
+            for id_card in sorted(current_ids):
+                prefix = f"hxacc/account/{id_card}/"
+                if uploader.object_exists(f"{prefix}finished"):
+                    stop_one(id_card)
+                    if id_card not in finished_notified:
+                        notifier.send_markdown(
+                            "\n".join(
+                                [
+                                    "✅ 课程学习已完成",
+                                    f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                                    f"idCard：{id_card}",
+                                    f"姓名：{name}"
+                                ]
+                            )
+                        )
+                        finished_notified.add(id_card)
+                    continue
+
+                account_path = account_dir / f"{id_card}.account"
+                if not account_path.exists():
+                    print(f"本地账户文件不存在：{account_path}", file=sys.stderr)
+                    continue
+
+                expired = _token_expired(account_path)
+                if expired:
+                    stop_one(id_card)
+                    if id_card not in expired_notified:
+                        notifier.send_markdown(
+                            "\n".join(
+                                [
+                                    "⚠️ Token 已过期，请重新获取 token",
+                                    f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                                    f"idCard：{id_card}",
+                                    f"账户文件：{account_path}",
+                                ]
+                            )
+                        )
+                        expired_notified.add(id_card)
+                    continue
+
+                if id_card not in watched:
+                    start_one(id_card, account_path)
+
+            for id_card in list(watched):
+                if id_card not in current_ids:
+                    stop_one(id_card)
+
+            for id_card, (proc, stdout_file, stderr_file) in list(watched.items()):
+                if proc.poll() is None:
+                    continue
+                stdout_file.close()
+                stderr_file.close()
+                watched.pop(id_card, None)
+                print(f"已结束：{id_card}")
+
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        stop_all()
+        return 0
     finally:
         notifier.close()
 
@@ -421,6 +632,31 @@ def _prepare_accounts(accounts: list[Account]) -> tuple[list[_PreparedAccount], 
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.command == "watch":
+        return _watch_accounts(Path(args.account_dir))
+
+    if args.account_file:
+        try:
+            account = load_account_file(Path(args.account_file).expanduser())
+        except AccountLoadError as exc:
+            print(str(exc), file=sys.stderr)
+            notifier = WeChatNotifier(DEFAULT_WECOM_WEBHOOK_URL)
+            notifier.send_exception(
+                app_id="<unknown>",
+                token_prefix="<unknown>",
+                device_id="<unknown>",
+                session_id="<account-file-error>",
+                exc=exc,
+                id_card="<unknown>",
+                name="<unknown>",
+            )
+            notifier.close()
+            return 2
+        prepared, exit_code = _prepare_accounts([account])
+        if not prepared:
+            return exit_code
+        return _run_prepared(prepared[0])
 
     if args.compensate:
         accounts = _load_compensation_accounts()

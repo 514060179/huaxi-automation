@@ -98,6 +98,32 @@ runs/.compensation_queue.jsonl
 .venv/bin/python -m integration_harness run --compensate --max-workers 5
 ```
 
+也可以以守护模式监控 OSS 目录 `hxacc/account/`：
+
+```bash
+.venv/bin/python -m integration_harness watch
+```
+
+同时读取本地账户目录下的 `.account` 文件：
+
+```bash
+.venv/bin/python -m integration_harness watch \
+  --account-dir /Users/liuyingying/simon/work/automation/account
+```
+
+扫描逻辑：
+
+- 若 OSS 中存在 `hxacc/account/{idCard}/finished`，推送“已完成”到企业微信。
+- 否则读取本地 `{idCard}.account`，如果 `tokenExpiresAt` 已过期，推送“请重新获取 token”到企业微信。
+- 如果未过期，则启动对应的课程学习子进程。
+
+扫描间隔通过 `ACCOUNT_WATCH_INTERVAL_SECONDS` 配置，默认 2 秒。子进程日志写入：
+
+```text
+runs/watch/{idCard}.out.log
+runs/watch/{idCard}.err.log
+```
+
 每个账户运行前，会把对应 `.account` 文件上传到：
 
 ```text
@@ -108,7 +134,10 @@ hxacc/account/{idCard}/{idCard}.account
 
 ```text
 hxacc/account/{idCard}/yyyyMMddHHmmss.success
+hxacc/account/{idCard}/finished
 ```
+
+其中 `finished` 文件为空内容，表示该账户的全部任务已经看完。
 
 认证二维码触发后，会生成并上传：
 
@@ -119,6 +148,10 @@ hxacc/account/{idCard}/{pointCode}.json
 
 `pointCode.json` 包含 `task_id`、`created_at`、`expires_at`、`sha256`。
 其中时间使用 `Asia/Shanghai`（`+08:00`），`sha256` 是 PNG 图片字节内容的 SHA-256，用于防止重扫。
+
+认证等待期间会通过 `/api/mycert/getTaskCert` 检查任务完成状态：根据姓名和身份证号查询列表，匹配 `taskId` 后，`extra.synced=1` 视为已完成；`synced=0` 或缺失则继续观看。若任务一直未完成，等待 30 分钟后会推送企业微信提醒，并自动恢复视频学习。
+
+任务主循环也会优先使用 `getTaskCert` 判断是否同步完成。即使本地课程进度 `lp=100`，只要 `synced != 1`，会继续定位 `courseList` 中的课程观看，不会误报“任务已全部看完”。
 
 `replay=true` 时，允许选择已经 `finish` 的小节进行重复播放；默认 `false` 跳过已完结小节。
 

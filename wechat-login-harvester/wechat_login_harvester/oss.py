@@ -36,7 +36,12 @@ class OssClient:
         if oss2 is None:
             raise RuntimeError("oss2 is not installed")
         auth = oss2.Auth(access_key_id, access_key_secret)
-        self.bucket = oss2.Bucket(auth, endpoint, bucket_name)
+        self.bucket = oss2.Bucket(
+            auth,
+            endpoint,
+            bucket_name,
+            proxies={"http": None, "https": None},
+        )
 
     def delete_prefix(self, prefix: str) -> OssDeleteResult:
         if not prefix.endswith("/"):

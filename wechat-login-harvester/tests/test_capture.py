@@ -1,4 +1,5 @@
 from pathlib import Path
+import logging
 
 from wechat_login_harvester.capture import (
     LoginCaptureAddon,
@@ -74,13 +75,11 @@ class FakeOss:
         self.uploaded_texts.append((key, content))
 
 
-def test_write_account_file_uploads_dot_account_and_manifest(tmp_path):
-    oss = FakeOss()
+def test_write_account_file_only_writes_local_account(tmp_path):
     addon = LoginCaptureAddon(
         login_url_marker="/index.php/api/user/wechatLogin",
         token_output_dir=tmp_path / "tokens",
         account_dir=tmp_path / "account",
-        oss_client=oss,
     )
 
     addon._write_account_file(
@@ -95,7 +94,24 @@ def test_write_account_file_uploads_dot_account_and_manifest(tmp_path):
 
     account_path = tmp_path / "account" / "id-1.account"
     assert account_path.exists()
-    assert oss.uploaded_files == [
-        (Path(account_path), "hxacc/account/id-1/id-1.account")
-    ]
-    assert oss.uploaded_texts[0][0] == "hxacc/account/id-1/account.json"
+
+
+def test_auth_url_detection_and_logging(tmp_path, caplog):
+    addon = LoginCaptureAddon(
+        login_url_marker="/index.php/api/user/wechatLogin",
+        token_output_dir=tmp_path / "tokens",
+        account_dir=tmp_path / "account",
+    )
+
+    assert addon._is_relevant_auth_url("https://example.com/index.php/api/user/unbind") is True
+    assert addon._is_relevant_auth_url("https://example.com/index.php/api/user/bind") is True
+    assert addon._is_relevant_auth_url("https://example.com/index.php/api/user/wechatLogin") is True
+    assert addon._is_relevant_auth_url("https://example.com/index.php/api/user/other") is False
+
+    with caplog.at_level(logging.INFO, logger="wechat_login_harvester.capture"):
+        addon._log_auth_response(
+            "https://example.com/index.php/api/user/unbind",
+            {"code": 0, "msg": "success"},
+        )
+
+    assert "unbind 响应：code=0 msg=success" in caplog.text

@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import oss2
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 @dataclass(frozen=True)
@@ -23,7 +26,13 @@ class OssAccountUploader:
         endpoint: str,
     ) -> None:
         auth = oss2.Auth(access_key_id, access_key_secret)
-        self.bucket = oss2.Bucket(auth, endpoint, bucket_name)
+        self.bucket = oss2.Bucket(
+            auth,
+            endpoint,
+            bucket_name,
+            proxies={"http": None, "https": None},
+        )
+        self.bucket.session.session.verify = False
 
     def upload_file(self, file_path: Path, key: str) -> OssUploadResult:
         try:
@@ -63,3 +72,13 @@ class OssAccountUploader:
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
+
+    def list_prefixes(self, prefix: str) -> list[str]:
+        result = self.bucket.list_objects(prefix=prefix, delimiter="/")
+        return [
+            item if isinstance(item, str) else item.prefix
+            for item in result.prefix_list
+        ]
+
+    def object_exists(self, key: str) -> bool:
+        return self.bucket.object_exists(key)

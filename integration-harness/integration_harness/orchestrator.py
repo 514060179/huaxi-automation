@@ -22,6 +22,8 @@ from .video import choose_m3u8_url, parse_m3u8
 from .wechat import WeChatNotifier
 
 
+logger = logging.getLogger(__name__)
+
 CN_TZ = timezone(timedelta(hours=8))
 
 
@@ -175,43 +177,64 @@ class Orchestrator:
         skipped_course_ids: set[str] = set()
 
         while True:
+            if self._is_task_completed(task_id):
+                self.logger.info("任务已完成（synced=1）：%s", task_id)
+                break
             course_id = self._next_unfinished_course_id(
                 detail,
                 exclude=skipped_course_ids,
             )
+            forced_course_list_id = ""
+            forced_watch = False
             if not course_id:
-                break
+                forced_course_list_id, course_id = self._cert_watch_target(task_id)
+                forced_watch = bool(course_id)
+                if not forced_watch:
+                    self.logger.warning(
+                        "任务未同步，但无法从 getTaskCert 定位待观看课程：%s",
+                        task_id,
+                    )
+                    break
 
             try:
-                course_list_id, course_ids = self._find_course_group(
-                    detail,
-                    course_id,
-                )
-                course_list = self._get_course_list(
-                    task_id,
-                    course_list_id,
-                    course_ids,
-                )
-                course_info, _ = self._select_course_and_doc(
-                    course_list,
-                    course_id=course_id,
-                )
-                self.logger.info(
-                    "选中课程：%s",
-                    course_info.get("title"),
-                )
-                course_title = course_info.get("title") or course_id
+                if forced_watch:
+                    course_list_id = forced_course_list_id
+                    course_title = course_id
+                    self.logger.info(
+                        "任务未同步，继续观看课程：%s",
+                        course_id,
+                    )
+                else:
+                    course_list_id, course_ids = self._find_course_group(
+                        detail,
+                        course_id,
+                    )
+                    course_list = self._get_course_list(
+                        task_id,
+                        course_list_id,
+                        course_ids,
+                    )
+                    course_info, _ = self._select_course_and_doc(
+                        course_list,
+                        course_id=course_id,
+                    )
+                    self.logger.info(
+                        "选中课程：%s",
+                        course_info.get("title"),
+                    )
+                    course_title = course_info.get("title") or course_id
                 self._watch_doc(
                     task_id=task_id,
                     course_id=course_id,
                     course_list_id=course_list_id,
                 )
                 detail = self._get_task_detail(task_id)
-                self._notify_course_completed_if_needed(
-                    detail,
-                    course_id=course_id,
-                    course_title=course_title,
-                )
+                if not forced_watch:
+                    self._notify_course_completed_if_needed(
+                        detail,
+                        course_id=course_id,
+                        course_title=course_title,
+                    )
             except _NoUnfinishedLearning as exc:
                 skipped_course_ids.add(course_id)
                 self.logger.info("课程 %s 跳过：%s", course_id, exc)
@@ -291,7 +314,7 @@ class Orchestrator:
             study_token="",
             point_code=None,
         )
-        point_state_data = point_state.get("data") or {}
+        point_state_data = self._coerce_data(point_state)
         study_token = point_state_data.get("studyToken") or ""
         point_code = point_state_data.get("pointCode") or ""
         qrcode_url = point_state_data.get("qrcodeUrl") or ""
@@ -313,6 +336,7 @@ class Orchestrator:
 
         self._set_state("learning")
         self._play_and_heartbeat(
+            task_id=task_id,
             mycourse_id=mycourse_id,
             doc_id=doc_id,
             study_token=study_token,
@@ -535,7 +559,7 @@ class Orchestrator:
         self,
         course_detail: dict[str, Any],
     ) -> str:
-        data = course_detail.get("data") or {}
+        data = Orchestrator._coerce_data(course_detail)
         doc_info = data.get("docInfo") or {}
         doc_id = doc_info.get("id") or doc_info.get("_id")
         if doc_id:
@@ -633,7 +657,7 @@ class Orchestrator:
         course_detail: dict[str, Any],
         doc_id: str,
     ) -> str:
-        data = course_detail.get("data") or {}
+        data = Orchestrator._coerce_data(course_detail)
         doc_info = data.get("docInfo") or {}
         if "random" in doc_info:
             return str(doc_info["random"])
@@ -675,6 +699,7 @@ class Orchestrator:
     def _play_and_heartbeat(
         self,
         *,
+        task_id: str,
         mycourse_id: str,
         doc_id: str,
         study_token: str,
@@ -731,7 +756,7 @@ class Orchestrator:
                     payload,
                     event_type="postUpdateTimeGuangdong",
                 )
-                data = response.get("data") or {}
+                data = self._coerce_data(response)
 
                 message = self._response_status_message(response)
                 if self._is_daily_limit_message(message):
@@ -741,12 +766,23 @@ class Orchestrator:
                         already_notified=notified,
                     )
 
+                if self._is_update_interval_too_short(message):
+                    wait_seconds = int(data.get("waitSeconds") or 60)
+                    update_number = 61 + wait_seconds
+                    self.logger.warning(
+                        "更新间隔太短，等待 %s 秒后继续心跳",
+                        wait_seconds,
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+
                 if self._heartbeat_needs_restart(response):
                     self.logger.warning("心跳返回业务提示：%s", message)
                     raise _RestartLearning(message)
 
                 if data.get("needPoint") is True or data.get("code") == 2:
                     self._handle_qr_verification(
+                        task_id=task_id,
                         mycourse_id=mycourse_id,
                         study_token=study_token,
                         trigger_data=data,
@@ -818,6 +854,7 @@ class Orchestrator:
     def _handle_qr_verification(
         self,
         *,
+        task_id: str,
         mycourse_id: str,
         study_token: str,
         trigger_data: dict[str, Any],
@@ -861,19 +898,28 @@ class Orchestrator:
             self.logger.info("复用二维码页面服务并更新二维码")
 
         qr_state = self.qr_state
-        page_url = f"http://127.0.0.1:{self.config.qr_page_port}/qr"
-        self.logger.info("打开二维码页面：%s", page_url)
-        webbrowser.open(page_url)
+        //暂不打开二维码
+#         page_url = f"http://127.0.0.1:{self.config.qr_page_port}/qr"
+#         self.logger.info("打开二维码页面：%s", page_url)
+#         webbrowser.open(page_url)
 
         self._set_state("polling_verification")
-        self._poll_until_verified(
+        outcome = self._poll_until_verified(
+            task_id=task_id,
             mycourse_id=mycourse_id,
             study_token=study_token,
             point_code=point_code,
             qr_state=qr_state,
         )
 
-        self.logger.info("认证成功，恢复学习")
+        if outcome == "completed":
+            self.logger.info("任务已完成，跳过恢复课程")
+            return
+        if outcome == "timeout":
+            self.logger.info("认证等待超时，继续视频学习")
+        else:
+            self.logger.info("认证成功，恢复学习")
+
         self._gd_call(
             "gdResumeCourse",
             mycourse_id=mycourse_id,
@@ -897,6 +943,10 @@ class Orchestrator:
     ) -> None:
         created_at = datetime.now(CN_TZ)
         expires_at = self._qr_expires_at(trigger_data, created_at)
+        self.logger.info(
+            "二维码过期时间：%s",
+            expires_at.astimezone(CN_TZ).isoformat(),
+        )
 
         png_bytes = self._qr_png_bytes(qrcode_url)
         sha256 = hashlib.sha256(png_bytes).hexdigest()
@@ -964,15 +1014,15 @@ class Orchestrator:
         created_at: datetime,
     ) -> datetime:
         check_end_time = trigger_data.get("checkEndTime")
-        if isinstance(check_end_time, (int, float)):
+        if isinstance(check_end_time, (int, float)) and check_end_time > 0:
             return datetime.fromtimestamp(check_end_time / 1000, tz=timezone.utc)
 
         validity_ms = trigger_data.get("validityMs")
-        if isinstance(validity_ms, (int, float)):
+        if isinstance(validity_ms, (int, float)) and validity_ms > 0:
             return created_at + timedelta(milliseconds=validity_ms)
 
         validity = trigger_data.get("validity")
-        if isinstance(validity, (int, float)):
+        if isinstance(validity, (int, float)) and validity > 0:
             return created_at + timedelta(seconds=validity)
 
         return created_at + timedelta(seconds=1800)
@@ -1005,12 +1055,14 @@ class Orchestrator:
     def _poll_until_verified(
         self,
         *,
+        task_id: str,
         mycourse_id: str,
         study_token: str,
         point_code: str,
         qr_state: QRPageState,
-    ) -> None:
+    ) -> str:
         poll_seconds = self.config.verify_poll_interval_seconds
+        deadline = time.monotonic() + (30 * 60)
         while True:
             result = self._gd_call(
                 "gdQueryVerificationResults",
@@ -1018,17 +1070,141 @@ class Orchestrator:
                 study_token=study_token,
                 point_code=point_code,
             )
-            data = result.get("data") or {}
+            data = self._coerce_data(result)
+            if self._is_task_completed(task_id):
+                qr_state.verify_status = "VERIFIED"
+                qr_state.message = "任务已完成，无需继续认证。"
+                return "completed"
             verify_result = data.get("verifyResult")
             if verify_result in ("1", 1, True):
                 qr_state.verify_status = "VERIFIED"
                 qr_state.message = "认证成功，可以继续恢复学习。"
-                return
+                return "verified"
+
+            if time.monotonic() >= deadline:
+                qr_state.verify_status = "PENDING"
+                qr_state.message = "认证等待超时，继续视频学习。"
+                self._notify_verification_timeout(
+                    point_code=point_code,
+                    waited_seconds=30 * 60,
+                )
+                return "timeout"
 
             qr_state.verify_status = "PENDING"
             qr_state.message = "等待扫码认证"
             self.logger.info("认证仍未完成，%s 秒后重试", poll_seconds)
             time.sleep(poll_seconds)
+
+    def _get_task_cert_synced(self, task_id: str) -> int:
+        item = self._get_task_cert_item(task_id)
+        if item is None:
+            return 0
+        extra = item.get("extra") or {}
+        if not isinstance(extra, dict):
+            extra = {}
+        synced = extra.get("synced")
+        return 1 if synced in (1, "1", True) else 0
+
+    def _get_task_cert_item(self, task_id: str) -> dict[str, Any] | None:
+        response = self._post_json(
+            "/api/mycert/getTaskCert",
+            {
+                "filter": {
+                    "realname": self.name,
+                    "idcard": self.id_card,
+                }
+            },
+            event_type="getTaskCert",
+        )
+        data = response.get("data")
+        items: list[dict[str, Any]] = []
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            raw_list = data.get("list") or data.get("items") or []
+            if isinstance(raw_list, list):
+                items = raw_list
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            mytask = item.get("mytask")
+            if not isinstance(mytask, dict):
+                source = item
+            else:
+                source = mytask
+            item_task_id = (
+                source.get("taskId")
+                or source.get("id")
+                or source.get("_id")
+                or item.get("taskId")
+                or item.get("id")
+                or item.get("_id")
+            )
+            if str(item_task_id) != str(task_id):
+                continue
+            return source if mytask is not None else item
+        return None
+
+    def _cert_watch_target(self, task_id: str) -> tuple[str, str]:
+        item = self._get_task_cert_item(task_id)
+        if item is None:
+            return "", ""
+        course_list = item.get("courseList") or []
+        if not isinstance(course_list, list):
+            return "", ""
+        for entry in course_list:
+            if not isinstance(entry, dict):
+                continue
+            course_list_id = entry.get("id") or entry.get("_id")
+            course_ids = entry.get("courseIds") or []
+            if course_list_id and course_ids:
+                return str(course_list_id), str(course_ids[0])
+        learned = item.get("learned") or {}
+        if isinstance(learned, dict) and learned:
+            return "", str(next(iter(learned)))
+        return "", ""
+
+    def _is_task_completed(self, task_id: str) -> bool:
+        return self._get_task_cert_synced(task_id) == 1
+
+    @staticmethod
+    def _data_learned_status(data: dict[str, Any]) -> int | None:
+        if isinstance(data.get("learnedStatus"), (int, float)):
+            return int(data["learnedStatus"])
+        mycourse_info = data.get("mycourseInfo") or {}
+        if isinstance(mycourse_info, dict):
+            value = mycourse_info.get("learnedStatus")
+            if isinstance(value, (int, float)):
+                return int(value)
+        return None
+
+    @classmethod
+    def _is_learned_complete(cls, data: dict[str, Any]) -> bool:
+        return cls._data_learned_status(data) == 2
+
+    def _notify_verification_timeout(
+        self,
+        *,
+        point_code: str,
+        waited_seconds: int,
+    ) -> None:
+        content = "\n".join(
+            [
+                "⚠️ 认证等待超时",
+                "",
+                f"时间：{datetime.now(CN_TZ):%Y-%m-%d %H:%M:%S}",
+                f"idCard：{self.id_card}",
+                f"姓名：{self.name}",
+                f"pointCode：{point_code}",
+                f"已等待：{waited_seconds // 60} 分钟",
+                "",
+                "系统继续视频学习。",
+            ]
+        )
+        ok = self.notifier.send_markdown(content)
+        if not ok:
+            self.logger.warning("认证超时企业微信推送失败，已写入本地待发队列")
 
     @staticmethod
     def _response_status_message(data: dict[str, Any]) -> str:
@@ -1038,6 +1214,16 @@ class Orchestrator:
             if isinstance(message, str):
                 return message
         return ""
+
+    @staticmethod
+    def _coerce_data(response: dict[str, Any]) -> dict[str, Any]:
+        data = response.get("data")
+        if data is None or data == {}:
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("响应 data 不是对象，已按空数据继续：%r", data)
+            return {}
+        return data
 
     @staticmethod
     def _heartbeat_needs_restart(response: dict[str, Any]) -> bool:
@@ -1050,6 +1236,10 @@ class Orchestrator:
             "学习时长已经超过" in message
             and "不继续累计时长" in message
         )
+
+    @staticmethod
+    def _is_update_interval_too_short(message: str) -> bool:
+        return "更新间隔太短" in message or "请稍后再试" in message
 
     def _send_daily_limit_notification(self, message: str) -> bool:
         ok = self.notifier.send_daily_limit(

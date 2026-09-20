@@ -89,3 +89,19 @@ def test_upload_bytes_success(monkeypatch):
 
     assert result.success is True
     assert fake_bucket.content == b"png"
+
+
+def test_list_prefixes_handles_string_items(monkeypatch):
+    class FakeBucket:
+        def list_objects(self, prefix, delimiter):
+            return type("Result", (), {"prefix_list": ["hxacc/account/id/"]})()
+
+    uploader = OssAccountUploader(
+        access_key_id="key",
+        access_key_secret="secret",
+        bucket_name="bucket",
+        endpoint="https://example.invalid",
+    )
+    monkeypatch.setattr(uploader, "bucket", FakeBucket())
+
+    assert uploader.list_prefixes("hxacc/account/") == ["hxacc/account/id/"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from .config import load_config
 from .login import LoginRunner
+from .oss import OssClient
 from .reconcile import reconcile
 from .wechat import WeChatNotifier
 
@@ -233,6 +235,33 @@ def _command_capture(config, notifier: WeChatNotifier | None) -> int:
     return 0
 
 
+def _upload_account_artifacts(
+    config,
+    user,
+    account_path: Path,
+) -> bool:
+    if not account_path.exists():
+        return False
+    oss = OssClient(
+        access_key_id=config.oss_access_key_id,
+        access_key_secret=config.oss_access_key_secret,
+        bucket_name=config.oss_bucket,
+        endpoint=config.oss_endpoint,
+    )
+    prefix = f"hxacc/account/{user.id_card}"
+    account_key = f"{prefix}/{account_path.name}"
+    manifest_key = f"{prefix}/account.json"
+    oss.upload_file(account_path, account_key)
+    oss.upload_text(
+        manifest_key,
+        json.dumps(
+            {"username": user.name, "id_card": user.id_card},
+            ensure_ascii=False,
+        ),
+    )
+    return True
+
+
 def _harvest_users(config, users, notifier: WeChatNotifier | None) -> int:
     config.token_output_dir.mkdir(parents=True, exist_ok=True)
     capture_run_dir = Path.cwd() / "runs" / _session_id()
@@ -275,8 +304,21 @@ def _harvest_users(config, users, notifier: WeChatNotifier | None) -> int:
                         config,
                         user,
                         screenshot_dir=run_dir / "screenshots",
+                        require_account_update=True,
                     )
                     runner.run()
+                    if account_path.exists():
+                        try:
+                            _upload_account_artifacts(config, user, account_path)
+                        except Exception as exc:
+                            _notify_failure(
+                                notifier,
+                                "OSS 上传失败",
+                                details={
+                                    **_user_details(user),
+                                    "异常": f"{type(exc).__name__}: {exc}",
+                                },
+                            )
                     time.sleep(2)
                     after_mtime = (
                         account_path.stat().st_mtime
