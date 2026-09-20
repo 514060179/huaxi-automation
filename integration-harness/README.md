@@ -115,10 +115,31 @@ runs/.compensation_queue.jsonl
 
 - 若 OSS 中存在 `hxacc/account/{idCard}/finished`，推送“已完成”到企业微信。
 - 若 OSS 中已存在 `hxacc/account/{idCard}/{idCard}.process`，说明该账户正在处理，跳过并记录日志。
+- `.process` 文件带租约信息，`PROCESS_LEASE_SECONDS` 默认 120 秒；过期后会自动清理并重新接管，避免设备异常退出后永久跳过。
 - 否则读取本地 `{idCard}.account`，如果 `tokenExpiresAt` 已过期，推送“请重新获取 token”到企业微信。
 - 如果未过期，则创建 `{idCard}.process` 后启动对应的课程学习子进程；进程结束或被杀前会删除该标记文件，删除失败会推送企业微信。
 
 扫描间隔通过 `ACCOUNT_WATCH_INTERVAL_SECONDS` 配置，默认 2 秒。子进程日志写入：
+
+多设备均衡通过槽位分配实现：
+
+- `ACCOUNT_SLOT_COUNT`：固定槽位数，默认 16。
+- `WORKER_ID`：当前设备 ID，默认 `device-01`。
+- `WORKER_IDS`：参与调度的设备 ID 列表，逗号分隔。
+
+每台设备只处理哈希后属于自己槽位的账户。当前只有一台设备时：
+
+```bash
+WORKER_ID=device-01
+WORKER_IDS=device-01
+```
+
+未来增加一台设备时，第二台配置：
+
+```bash
+WORKER_ID=device-02
+WORKER_IDS=device-01,device-02
+```
 
 ```text
 runs/watch/{idCard}.out.log

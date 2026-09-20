@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -10,7 +11,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .accounts import Account, AccountLoadError, load_account_file, load_accounts
@@ -423,6 +424,11 @@ def _token_expired(account_path: Path) -> bool:
     return datetime.now().timestamp() >= float(expires_at)
 
 
+def _account_slot(id_card: str, slot_count: int) -> int:
+    digest = hashlib.sha256(id_card.encode("utf-8")).hexdigest()
+    return int(digest, 16) % slot_count
+
+
 def _stop_watched_process(
     proc: subprocess.Popen,
     stdout_file,
@@ -442,6 +448,17 @@ def _stop_watched_process(
 def _watch_accounts(account_dir: Path) -> int:
     account_dir = account_dir.expanduser()
     interval = float(os.getenv("ACCOUNT_WATCH_INTERVAL_SECONDS", "2"))
+    slot_count = int(os.getenv("ACCOUNT_SLOT_COUNT", "16"))
+    worker_id = os.getenv("WORKER_ID", "device-01")
+    active_worker_ids = [
+        item.strip()
+        for item in os.getenv("WORKER_IDS", worker_id).split(",")
+        if item.strip()
+    ]
+    if worker_id not in active_worker_ids:
+        active_worker_ids.append(worker_id)
+    active_worker_ids = sorted(active_worker_ids)
+    my_worker_index = active_worker_ids.index(worker_id)
     config = load_config(
         {
             "HXACC_TOKEN": "watch-mode",
@@ -463,6 +480,8 @@ def _watch_accounts(account_dir: Path) -> int:
     watched: dict[str, tuple[subprocess.Popen, object, object]] = {}
     finished_notified: set[str] = set()
     expired_notified: set[str] = set()
+    process_ttl_seconds = int(os.getenv("PROCESS_LEASE_SECONDS", "120"))
+    last_renew: dict[str, float] = {}
     print(f"开始监控 OSS hxacc/account/，本地账户目录 {account_dir}，扫描间隔 {interval}s")
 
     def process_key(id_card: str) -> str:
@@ -480,15 +499,30 @@ def _watch_accounts(account_dir: Path) -> int:
             )
         )
 
-    def create_process_file(id_card: str) -> bool:
+    def write_process_file(id_card: str) -> bool:
         key = process_key(id_card)
-        result = uploader.upload_text(key, "")
+        now = datetime.now(timezone.utc)
+        payload = {
+            "worker_id": worker_id,
+            "started_at": now.isoformat(),
+            "expires_at": (now + timedelta(seconds=process_ttl_seconds)).isoformat(),
+        }
+        result = uploader.upload_text(
+            key,
+            json.dumps(payload, ensure_ascii=False),
+        )
         if not result.success:
-            print(f"创建进程标记失败 {key}: {result.error}", file=sys.stderr)
-            notify_process_file_failure("创建", key, result.error or "未知错误")
+            print(f"写入进程标记失败 {key}: {result.error}", file=sys.stderr)
+            notify_process_file_failure("写入", key, result.error or "未知错误")
             return False
-        print(f"已创建进程标记：{key}")
+        last_renew[id_card] = time.monotonic()
         return True
+
+    def create_process_file(id_card: str) -> bool:
+        ok = write_process_file(id_card)
+        if ok:
+            print(f"已创建进程标记：{process_key(id_card)}")
+        return ok
 
     def delete_process_file(id_card: str) -> bool:
         key = process_key(id_card)
@@ -500,9 +534,31 @@ def _watch_accounts(account_dir: Path) -> int:
         print(f"已删除进程标记：{key}")
         return True
 
+    def process_is_active(id_card: str) -> bool:
+        key = process_key(id_card)
+        if not uploader.object_exists(key):
+            return False
+        try:
+            content = uploader.get_object_text(key)
+            payload = json.loads(content)
+            expires_at = payload.get("expires_at")
+            expires_timestamp = datetime.fromisoformat(expires_at).timestamp()
+        except Exception:
+            return False
+        return datetime.now(timezone.utc).timestamp() < expires_timestamp
+
+    def renew_process_file(id_card: str) -> None:
+        if id_card not in watched:
+            return
+        last = last_renew.get(id_card, 0.0)
+        if time.monotonic() - last < (process_ttl_seconds / 2):
+            return
+        write_process_file(id_card)
+
     def stop_all() -> None:
         for path, (proc, stdout_file, stderr_file) in list(watched.items()):
             delete_process_file(path)
+            last_renew.pop(path, None)
             _stop_watched_process(proc, stdout_file, stderr_file)
             print(f"已停止：{path}")
         watched.clear()
@@ -512,6 +568,7 @@ def _watch_accounts(account_dir: Path) -> int:
             return
         proc, stdout_file, stderr_file = watched.pop(id_card)
         delete_process_file(id_card)
+        last_renew.pop(id_card, None)
         _stop_watched_process(proc, stdout_file, stderr_file)
         print(f"已停止：{id_card}")
 
@@ -539,6 +596,10 @@ def _watch_accounts(account_dir: Path) -> int:
             }
 
             for id_card in sorted(current_ids):
+                slot = _account_slot(id_card, slot_count)
+                if slot % len(active_worker_ids) != my_worker_index:
+                    continue
+
                 prefix = f"hxacc/account/{id_card}/"
                 if uploader.object_exists(f"{prefix}finished"):
                     if id_card in watched:
@@ -564,8 +625,12 @@ def _watch_accounts(account_dir: Path) -> int:
                     continue
 
                 if uploader.object_exists(process_key(id_card)):
-                    print(f"跳过账户 {id_card}：{id_card}.process 已存在")
-                    continue
+                    if process_is_active(id_card):
+                        print(f"跳过账户 {id_card}：{id_card}.process 租约有效")
+                        continue
+                    print(f"清理过期进程标记：{process_key(id_card)}")
+                    if not delete_process_file(id_card):
+                        continue
 
                 expired = _token_expired(account_path)
                 if expired:
@@ -592,10 +657,14 @@ def _watch_accounts(account_dir: Path) -> int:
                 if id_card not in current_ids:
                     stop_one(id_card)
 
+            for id_card in list(watched):
+                renew_process_file(id_card)
+
             for id_card, (proc, stdout_file, stderr_file) in list(watched.items()):
                 if proc.poll() is None:
                     continue
                 delete_process_file(id_card)
+                last_renew.pop(id_card, None)
                 stdout_file.close()
                 stderr_file.close()
                 watched.pop(id_card, None)

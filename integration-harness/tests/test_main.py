@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from integration_harness.accounts import Account
 from integration_harness.main import (
+    _account_slot,
     _account_file_paths,
     _append_compensation,
     _compensation_sources,
@@ -108,6 +109,11 @@ def test_single_account_command(tmp_path):
     command = _single_account_command(account)
 
     assert command[-2:] == ["--account-file", str(account)]
+
+
+def test_account_slot_is_stable_and_in_range():
+    assert _account_slot("id-1", 16) == _account_slot("id-1", 16)
+    assert 0 <= _account_slot("id-1", 16) < 16
 
 
 class _FakePopen:

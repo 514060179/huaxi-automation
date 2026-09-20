@@ -83,6 +83,10 @@ class OssAccountUploader:
     def object_exists(self, key: str) -> bool:
         return self.bucket.object_exists(key)
 
+    def get_object_text(self, key: str) -> str:
+        result = self.bucket.get_object(key)
+        return result.read().decode("utf-8")
+
     def delete_object(self, key: str) -> OssUploadResult:
         try:
             self.bucket.delete_object(key)
