@@ -149,6 +149,12 @@ def test_watch_accounts_starts_and_stops_child(tmp_path, monkeypatch):
         def object_exists(self, key):
             return False
 
+        def upload_text(self, key, content=""):
+            return SimpleNamespace(key=key, success=True, error=None)
+
+        def delete_object(self, key):
+            return SimpleNamespace(key=key, success=True, error=None)
+
     class FakeNotifier:
         def __init__(self, *args, **kwargs):
             self.sent = []

@@ -465,8 +465,44 @@ def _watch_accounts(account_dir: Path) -> int:
     expired_notified: set[str] = set()
     print(f"开始监控 OSS hxacc/account/，本地账户目录 {account_dir}，扫描间隔 {interval}s")
 
+    def process_key(id_card: str) -> str:
+        return f"hxacc/account/{id_card}/{id_card}.process"
+
+    def notify_process_file_failure(action: str, key: str, error: str) -> None:
+        notifier.send_markdown(
+            "\n".join(
+                [
+                    f"⚠️ 进程标记文件{action}失败",
+                    f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                    f"key：{key}",
+                    f"原因：{error}",
+                ]
+            )
+        )
+
+    def create_process_file(id_card: str) -> bool:
+        key = process_key(id_card)
+        result = uploader.upload_text(key, "")
+        if not result.success:
+            print(f"创建进程标记失败 {key}: {result.error}", file=sys.stderr)
+            notify_process_file_failure("创建", key, result.error or "未知错误")
+            return False
+        print(f"已创建进程标记：{key}")
+        return True
+
+    def delete_process_file(id_card: str) -> bool:
+        key = process_key(id_card)
+        result = uploader.delete_object(key)
+        if not result.success:
+            print(f"删除进程标记失败 {key}: {result.error}", file=sys.stderr)
+            notify_process_file_failure("删除", key, result.error or "未知错误")
+            return False
+        print(f"已删除进程标记：{key}")
+        return True
+
     def stop_all() -> None:
         for path, (proc, stdout_file, stderr_file) in list(watched.items()):
+            delete_process_file(path)
             _stop_watched_process(proc, stdout_file, stderr_file)
             print(f"已停止：{path}")
         watched.clear()
@@ -475,6 +511,7 @@ def _watch_accounts(account_dir: Path) -> int:
         if id_card not in watched:
             return
         proc, stdout_file, stderr_file = watched.pop(id_card)
+        delete_process_file(id_card)
         _stop_watched_process(proc, stdout_file, stderr_file)
         print(f"已停止：{id_card}")
 
@@ -504,7 +541,10 @@ def _watch_accounts(account_dir: Path) -> int:
             for id_card in sorted(current_ids):
                 prefix = f"hxacc/account/{id_card}/"
                 if uploader.object_exists(f"{prefix}finished"):
-                    stop_one(id_card)
+                    if id_card in watched:
+                        stop_one(id_card)
+                    elif uploader.object_exists(process_key(id_card)):
+                        delete_process_file(id_card)
                     if id_card not in finished_notified:
                         notifier.send_markdown(
                             "\n".join(
@@ -512,7 +552,6 @@ def _watch_accounts(account_dir: Path) -> int:
                                     "✅ 课程学习已完成",
                                     f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
                                     f"idCard：{id_card}",
-                                    f"姓名：{name}"
                                 ]
                             )
                         )
@@ -522,6 +561,10 @@ def _watch_accounts(account_dir: Path) -> int:
                 account_path = account_dir / f"{id_card}.account"
                 if not account_path.exists():
                     print(f"本地账户文件不存在：{account_path}", file=sys.stderr)
+                    continue
+
+                if uploader.object_exists(process_key(id_card)):
+                    print(f"跳过账户 {id_card}：{id_card}.process 已存在")
                     continue
 
                 expired = _token_expired(account_path)
@@ -542,7 +585,8 @@ def _watch_accounts(account_dir: Path) -> int:
                     continue
 
                 if id_card not in watched:
-                    start_one(id_card, account_path)
+                    if create_process_file(id_card):
+                        start_one(id_card, account_path)
 
             for id_card in list(watched):
                 if id_card not in current_ids:
@@ -551,6 +595,7 @@ def _watch_accounts(account_dir: Path) -> int:
             for id_card, (proc, stdout_file, stderr_file) in list(watched.items()):
                 if proc.poll() is None:
                     continue
+                delete_process_file(id_card)
                 stdout_file.close()
                 stderr_file.close()
                 watched.pop(id_card, None)

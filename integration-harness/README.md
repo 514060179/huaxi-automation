@@ -114,8 +114,9 @@ runs/.compensation_queue.jsonl
 扫描逻辑：
 
 - 若 OSS 中存在 `hxacc/account/{idCard}/finished`，推送“已完成”到企业微信。
+- 若 OSS 中已存在 `hxacc/account/{idCard}/{idCard}.process`，说明该账户正在处理，跳过并记录日志。
 - 否则读取本地 `{idCard}.account`，如果 `tokenExpiresAt` 已过期，推送“请重新获取 token”到企业微信。
-- 如果未过期，则启动对应的课程学习子进程。
+- 如果未过期，则创建 `{idCard}.process` 后启动对应的课程学习子进程；进程结束或被杀前会删除该标记文件，删除失败会推送企业微信。
 
 扫描间隔通过 `ACCOUNT_WATCH_INTERVAL_SECONDS` 配置，默认 2 秒。子进程日志写入：
 

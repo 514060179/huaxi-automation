@@ -82,3 +82,14 @@ class OssAccountUploader:
 
     def object_exists(self, key: str) -> bool:
         return self.bucket.object_exists(key)
+
+    def delete_object(self, key: str) -> OssUploadResult:
+        try:
+            self.bucket.delete_object(key)
+            return OssUploadResult(key=key, success=True)
+        except Exception as exc:
+            return OssUploadResult(
+                key=key,
+                success=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )

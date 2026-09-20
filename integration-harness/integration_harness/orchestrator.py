@@ -898,7 +898,7 @@ class Orchestrator:
             self.logger.info("复用二维码页面服务并更新二维码")
 
         qr_state = self.qr_state
-        //暂不打开二维码
+#        暂不打开二维码
 #         page_url = f"http://127.0.0.1:{self.config.qr_page_port}/qr"
 #         self.logger.info("打开二维码页面：%s", page_url)
 #         webbrowser.open(page_url)
