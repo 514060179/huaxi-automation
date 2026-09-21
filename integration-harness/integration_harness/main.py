@@ -587,88 +587,110 @@ def _watch_accounts(account_dir: Path) -> int:
         print(f"已启动：{id_card}")
 
     try:
+        consecutive_oss_failures = 0
         while True:
-            prefixes = uploader.list_prefixes("hxacc/account/")
-            current_ids = {
-                prefix.rstrip("/").rsplit("/", 1)[-1]
-                for prefix in prefixes
-                if prefix.rstrip("/").startswith("hxacc/account/")
-            }
+            try:
+                prefixes = uploader.list_prefixes("hxacc/account/")
+                current_ids = {
+                    prefix.rstrip("/").rsplit("/", 1)[-1]
+                    for prefix in prefixes
+                    if prefix.rstrip("/").startswith("hxacc/account/")
+                }
 
-            for id_card in sorted(current_ids):
-                slot = _account_slot(id_card, slot_count)
-                if slot % len(active_worker_ids) != my_worker_index:
-                    continue
+                for id_card in sorted(current_ids):
+                    slot = _account_slot(id_card, slot_count)
+                    if slot % len(active_worker_ids) != my_worker_index:
+                        continue
 
-                prefix = f"hxacc/account/{id_card}/"
-                if uploader.object_exists(f"{prefix}finished"):
-                    if id_card in watched:
+                    prefix = f"hxacc/account/{id_card}/"
+                    if uploader.object_exists(f"{prefix}finished"):
+                        if id_card in watched:
+                            stop_one(id_card)
+                        elif uploader.object_exists(process_key(id_card)):
+                            delete_process_file(id_card)
+                        if id_card not in finished_notified:
+                            notifier.send_markdown(
+                                "\n".join(
+                                    [
+                                        "✅ 课程学习已完成",
+                                        f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                                        f"idCard：{id_card}",
+                                    ]
+                                )
+                            )
+                            finished_notified.add(id_card)
+                        continue
+
+                    account_path = account_dir / f"{id_card}.account"
+                    if not account_path.exists():
+                        print(f"本地账户文件不存在：{account_path}", file=sys.stderr)
+                        continue
+
+                    if uploader.object_exists(process_key(id_card)):
+                        if process_is_active(id_card):
+                            print(f"跳过账户 {id_card}：{id_card}.process 租约有效")
+                            continue
+                        print(f"清理过期进程标记：{process_key(id_card)}")
+                        if not delete_process_file(id_card):
+                            continue
+
+                    expired = _token_expired(account_path)
+                    if expired:
                         stop_one(id_card)
-                    elif uploader.object_exists(process_key(id_card)):
-                        delete_process_file(id_card)
-                    if id_card not in finished_notified:
-                        notifier.send_markdown(
-                            "\n".join(
-                                [
-                                    "✅ 课程学习已完成",
-                                    f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-                                    f"idCard：{id_card}",
-                                ]
+                        if id_card not in expired_notified:
+                            notifier.send_markdown(
+                                "\n".join(
+                                    [
+                                        "⚠️ Token 已过期，请重新获取 token",
+                                        f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                                        f"idCard：{id_card}",
+                                        f"账户文件：{account_path}",
+                                    ]
+                                )
                             )
-                        )
-                        finished_notified.add(id_card)
-                    continue
-
-                account_path = account_dir / f"{id_card}.account"
-                if not account_path.exists():
-                    print(f"本地账户文件不存在：{account_path}", file=sys.stderr)
-                    continue
-
-                if uploader.object_exists(process_key(id_card)):
-                    if process_is_active(id_card):
-                        print(f"跳过账户 {id_card}：{id_card}.process 租约有效")
-                        continue
-                    print(f"清理过期进程标记：{process_key(id_card)}")
-                    if not delete_process_file(id_card):
+                            expired_notified.add(id_card)
                         continue
 
-                expired = _token_expired(account_path)
-                if expired:
-                    stop_one(id_card)
-                    if id_card not in expired_notified:
-                        notifier.send_markdown(
-                            "\n".join(
-                                [
-                                    "⚠️ Token 已过期，请重新获取 token",
-                                    f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-                                    f"idCard：{id_card}",
-                                    f"账户文件：{account_path}",
-                                ]
-                            )
+                    if id_card not in watched:
+                        if create_process_file(id_card):
+                            start_one(id_card, account_path)
+
+                for id_card in list(watched):
+                    if id_card not in current_ids:
+                        stop_one(id_card)
+
+                for id_card in list(watched):
+                    renew_process_file(id_card)
+
+                for id_card, (proc, stdout_file, stderr_file) in list(watched.items()):
+                    if proc.poll() is None:
+                        continue
+                    delete_process_file(id_card)
+                    last_renew.pop(id_card, None)
+                    stdout_file.close()
+                    stderr_file.close()
+                    watched.pop(id_card, None)
+                    print(f"已结束：{id_card}")
+            except Exception as exc:
+                consecutive_oss_failures += 1
+                print(
+                    f"OSS 扫描失败，等待后重试：{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                if consecutive_oss_failures >= 3:
+                    notifier.send_markdown(
+                        "\n".join(
+                            [
+                                "⚠️ OSS 扫描连续失败",
+                                f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                                f"连续失败次数：{consecutive_oss_failures}",
+                                f"最后异常：{type(exc).__name__}: {exc}",
+                            ]
                         )
-                        expired_notified.add(id_card)
-                    continue
-
-                if id_card not in watched:
-                    if create_process_file(id_card):
-                        start_one(id_card, account_path)
-
-            for id_card in list(watched):
-                if id_card not in current_ids:
-                    stop_one(id_card)
-
-            for id_card in list(watched):
-                renew_process_file(id_card)
-
-            for id_card, (proc, stdout_file, stderr_file) in list(watched.items()):
-                if proc.poll() is None:
-                    continue
-                delete_process_file(id_card)
-                last_renew.pop(id_card, None)
-                stdout_file.close()
-                stderr_file.close()
-                watched.pop(id_card, None)
-                print(f"已结束：{id_card}")
+                    )
+                    consecutive_oss_failures = 0
+            else:
+                consecutive_oss_failures = 0
 
             time.sleep(interval)
     except KeyboardInterrupt:

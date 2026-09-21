@@ -24,12 +24,14 @@ class OssAccountUploader:
         access_key_secret: str,
         bucket_name: str,
         endpoint: str,
+        connect_timeout: int = 10,
     ) -> None:
         auth = oss2.Auth(access_key_id, access_key_secret)
         self.bucket = oss2.Bucket(
             auth,
             endpoint,
             bucket_name,
+            connect_timeout=connect_timeout,
             proxies={"http": None, "https": None},
         )
         self.bucket.session.session.verify = False

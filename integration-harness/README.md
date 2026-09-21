@@ -116,6 +116,7 @@ runs/.compensation_queue.jsonl
 - 若 OSS 中存在 `hxacc/account/{idCard}/finished`，推送“已完成”到企业微信。
 - 若 OSS 中已存在 `hxacc/account/{idCard}/{idCard}.process`，说明该账户正在处理，跳过并记录日志。
 - `.process` 文件带租约信息，`PROCESS_LEASE_SECONDS` 默认 120 秒；过期后会自动清理并重新接管，避免设备异常退出后永久跳过。
+- OSS 请求连接超时默认 10 秒；单次扫描失败不会退出 watch，会等待下一轮重试，连续失败 3 次会推送企业微信。
 - 否则读取本地 `{idCard}.account`，如果 `tokenExpiresAt` 已过期，推送“请重新获取 token”到企业微信。
 - 如果未过期，则创建 `{idCard}.process` 后启动对应的课程学习子进程；进程结束或被杀前会删除该标记文件，删除失败会推送企业微信。
 
