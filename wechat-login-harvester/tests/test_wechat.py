@@ -25,4 +25,4 @@ def test_send_failure_writes_outbox_on_http_error(tmp_path, monkeypatch):
     assert not ok
     lines = notifier.outbox_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
-    assert json.loads(lines[0])["content"].startswith("⚠️ 测试失败")
+    assert json.loads(lines[0])["content"].startswith("【wechat-login-harvester】⚠️ 测试失败")

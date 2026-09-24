@@ -15,7 +15,7 @@ def test_failed_send_writes_outbox(tmp_path):
     assert notifier.send_markdown("hello") is False
 
     lines = outbox_path.read_text(encoding="utf-8").splitlines()
-    assert json.loads(lines[0]) == {"content": "hello"}
+    assert json.loads(lines[0]) == {"content": "【integration-harness】hello"}
 
 
 def test_flush_outbox_removes_delivered_messages(tmp_path):

@@ -148,5 +148,6 @@ class HxaccClient:
 
         raise ApiError(
             f"GET video segment failed after {retries} attempts: {last_error}",
+            status_code=getattr(last_error, "status_code", None),
             response_text=str(last_error)[:300],
         )

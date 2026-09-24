@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
 
 import httpx
+
+
+DEFAULT_TAG = os.getenv("WECOM_NOTIFY_TAG", "【integration-harness】")
 
 
 class WeChatNotifier:
@@ -16,16 +20,19 @@ class WeChatNotifier:
         timeout: float = 10.0,
         max_retries: int = 5,
         outbox_path: Path | None = None,
+        tag: str = DEFAULT_TAG,
     ) -> None:
         self.webhook_url = webhook_url
         self.max_retries = max_retries
         self.outbox_path = outbox_path
+        self.tag = tag or ""
         self.client = httpx.Client(timeout=timeout)
 
     def close(self) -> None:
         self.client.close()
 
     def send_markdown(self, content: str) -> bool:
+        content = f"{self.tag}{content}"
         if self._post_with_retries(content):
             return True
         self._append_outbox(content)

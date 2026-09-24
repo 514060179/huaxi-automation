@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
 
 import httpx
+
+
+DEFAULT_TAG = os.getenv("WECOM_NOTIFY_TAG", "【wechat-login-harvester】")
 
 
 class WeChatNotifier:
@@ -18,10 +22,12 @@ class WeChatNotifier:
         timeout: float = 10.0,
         max_retries: int = 5,
         outbox_path: Path | None = None,
+        tag: str = DEFAULT_TAG,
     ) -> None:
         self.webhook_url = webhook_url
         self.max_retries = max_retries
         self.outbox_path = outbox_path
+        self.tag = tag or ""
         self.client = httpx.Client(timeout=timeout)
 
     def close(self) -> None:
@@ -40,7 +46,7 @@ class WeChatNotifier:
         ]
         for key, value in (details or {}).items():
             lines.append(f"{key}：{value}")
-        content = "\n".join(lines)
+        content = f"{self.tag}" + "\n".join(lines)
         if self._post_with_retries(content):
             return True
         self._append_outbox(content)
@@ -70,4 +76,3 @@ class WeChatNotifier:
         self.outbox_path.parent.mkdir(parents=True, exist_ok=True)
         with self.outbox_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps({"content": content}, ensure_ascii=False) + "\n")
-

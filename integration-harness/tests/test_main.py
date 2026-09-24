@@ -12,6 +12,7 @@ from integration_harness.main import (
     _is_in_run_window,
     _prepare_accounts,
     _remove_compensation,
+    _resume_account,
     _single_account_command,
     _watch_accounts,
     build_parser,
@@ -45,6 +46,13 @@ def test_parser_accepts_watch_and_single_account_file():
     )
     assert run_args.command == "run"
     assert run_args.account_file == "/tmp/account/id.account"
+
+
+def test_parser_accepts_resume_and_id_card():
+    parser = build_parser()
+    args = parser.parse_args(["resume", "--id-card", "id-1"])
+    assert args.command == "resume"
+    assert args.id_card == "id-1"
 
 
 def test_is_in_run_window_respects_hours():
@@ -109,6 +117,55 @@ def test_single_account_command(tmp_path):
     command = _single_account_command(account)
 
     assert command[-2:] == ["--account-file", str(account)]
+
+
+def test_resume_account_deletes_stop_marker_and_notifies(monkeypatch):
+    class FakeUploader:
+        def __init__(self, **kwargs):
+            self.deleted = []
+
+        def object_exists(self, key):
+            return True
+
+        def delete_object(self, key):
+            self.deleted.append(key)
+            return SimpleNamespace(key=key, success=True, error=None)
+
+    class FakeNotifier:
+        def __init__(self, *args, **kwargs):
+            self.sent = []
+
+        def send_markdown(self, content):
+            self.sent.append(content)
+            return True
+
+        def close(self):
+            pass
+
+    uploader = FakeUploader()
+    monkeypatch.setattr(
+        "integration_harness.main.load_config",
+        lambda overrides=None: SimpleNamespace(
+            wecom_webhook_url="https://example.com/hook",
+            oss_bucket="bucket",
+            oss_access_key_id="key",
+            oss_access_key_secret="secret",
+            oss_endpoint="https://example.com",
+        ),
+    )
+    monkeypatch.setattr(
+        "integration_harness.main.OssAccountUploader",
+        lambda **kwargs: uploader,
+    )
+    monkeypatch.setattr(
+        "integration_harness.main.WeChatNotifier",
+        FakeNotifier,
+    )
+
+    result = _resume_account("id-1")
+
+    assert result == 0
+    assert uploader.deleted == ["hxacc/account/id-1/stop"]
 
 
 def test_account_slot_is_stable_and_in_range():

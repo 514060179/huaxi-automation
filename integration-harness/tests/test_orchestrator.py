@@ -5,8 +5,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from integration_harness.client import ApiError
 from integration_harness.orchestrator import (
     Orchestrator,
+    _AuthVerificationFailed,
     _NoUnfinishedLearning,
 )
 
@@ -394,30 +396,28 @@ def _poll_runner():
     return runner
 
 
-def test_poll_until_verified_returns_completed():
+def test_poll_until_verified_returns_on_success():
     runner = _poll_runner()
-    runner._gd_call = lambda method, **kwargs: {"data": {}}
-    runner._is_task_completed = lambda task_id: True
+    runner._gd_call = lambda method, **kwargs: {"data": {"verifyResult": "1"}}
     qr_state = SimpleNamespace()
 
-    outcome = runner._poll_until_verified(
-        task_id="task-1",
+    runner._poll_until_verified(
         mycourse_id="course-1",
         study_token="token-1",
         point_code="point-1",
         qr_state=qr_state,
     )
 
-    assert outcome == "completed"
     assert qr_state.verify_status == "VERIFIED"
 
 
-def test_poll_until_verified_returns_timeout_and_notifies(monkeypatch):
+def test_poll_until_verified_stops_and_notifies_on_timeout(monkeypatch):
     runner = _poll_runner()
     runner._gd_call = lambda method, **kwargs: {"data": {"verifyResult": "0"}}
-    runner._is_task_completed = lambda task_id: False
     notified = []
-    runner._notify_verification_timeout = lambda **kwargs: notified.append(kwargs)
+    runner._notify_verification_failed = lambda **kwargs: notified.append(kwargs)
+    stopped = []
+    runner._mark_account_stopped = lambda: stopped.append(True)
     monkeypatch.setattr(
         "integration_harness.orchestrator.time.monotonic",
         iter([0, 2000]).__next__,
@@ -428,16 +428,16 @@ def test_poll_until_verified_returns_timeout_and_notifies(monkeypatch):
     )
     qr_state = SimpleNamespace()
 
-    outcome = runner._poll_until_verified(
-        task_id="task-1",
-        mycourse_id="course-1",
-        study_token="token-1",
-        point_code="point-1",
-        qr_state=qr_state,
-    )
+    with pytest.raises(_AuthVerificationFailed):
+        runner._poll_until_verified(
+            mycourse_id="course-1",
+            study_token="token-1",
+            point_code="point-1",
+            qr_state=qr_state,
+        )
 
-    assert outcome == "timeout"
     assert notified[0]["point_code"] == "point-1"
+    assert stopped == [True]
 
 
 class _FakeOssUploader:
@@ -479,6 +479,52 @@ def test_upload_qr_artifacts_writes_png_and_required_json():
     assert payload["created_at"].endswith("+08:00")
     assert payload["expires_at"].endswith("+08:00")
     assert payload["sha256"] == hashlib.sha256(png_bytes).hexdigest()
+
+
+def test_mark_account_stopped_writes_stop_key():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.id_card = "id-1"
+    orchestrator.logger = _DummyLogger()
+    orchestrator.oss_uploader = _FakeOssUploader()
+
+    orchestrator._mark_account_stopped()
+
+    assert orchestrator.oss_uploader.texts == [("hxacc/account/id-1/stop", "")]
+
+
+def test_signal_relogin_writes_signal():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.id_card = "id-1"
+    orchestrator.logger = _DummyLogger()
+    orchestrator.oss_uploader = _FakeOssUploader()
+
+    orchestrator._signal_relogin()
+
+    assert orchestrator.oss_uploader.texts == [
+        ("hxacc/account/id-1/relogin", '{"attempts": 0}'),
+        ("hxacc/account/id-1/stop", ""),
+    ]
+
+
+def test_post_json_signals_relogin_on_401():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.logger = _DummyLogger()
+    orchestrator.client = SimpleNamespace(
+        post_learn_json=lambda path, payload: (_ for _ in ()).throw(
+            ApiError("unauthorized", status_code=401)
+        )
+    )
+    signaled: list[bool] = []
+    orchestrator._signal_relogin = lambda: signaled.append(True)
+
+    with pytest.raises(ApiError):
+        orchestrator._post_json(
+            "/api/mycourse/postUpdateTimeGuangdong",
+            {},
+            event_type="postUpdateTimeGuangdong",
+        )
+
+    assert signaled == [True]
 
 
 def test_select_course_and_doc_filters_by_course_id():

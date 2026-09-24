@@ -10,6 +10,7 @@ python -m wechat_login_harvester capture
 python -m wechat_login_harvester harvest
 python -m wechat_login_harvester reconcile
 python -m wechat_login_harvester watch
+python -m wechat_login_harvester bot
 ```
 
 - `login`：执行 UI 登录流程。
@@ -17,6 +18,13 @@ python -m wechat_login_harvester watch
 - `harvest`：同时启动抓包代理和 UI 登录。
 - `reconcile`：按 `USER_FILE` 对账，删除已标记跳过用户的本地 `.account` 和 OSS 目录。
 - `watch`：持续监控 `USER_FILE`，有变更时自动对账，并对新增用户重新采集 token。
+- `bot`：仅启动企业微信智能机器人长连接，处理用户增删改查指令（`watch` 会自动附带启动机器人）。
+
+`watch` 还会轮询 OSS 的 `hxacc/account/{idCard}/relogin` 重新登录信号：
+integration-harness 遇到视频 401 时写入该信号，`watch` 检测到后对对应用户重新执行
+登录并采集新 token，成功后删除 `relogin` 信号与 `stop` 停止标记以恢复学习。若重新
+登录连续失败超过 2 次，会推送企业微信要求马上修复，并删除 `relogin` 信号停止自动
+重试（`stop` 标记保留，账户保持停止等待人工处理）。
 
 ## 配置
 
@@ -35,7 +43,48 @@ cp .env.example .env
 - `WATCH_INTERVAL_SECONDS`：`watch` 命令的轮询间隔，默认 5 秒
 - `LOGIN_LOGOUT_DELAY_SECONDS`：每次登录、登出前等待的秒数，默认 30 秒
 - `WECOM_WEBHOOK_URL`：企业微信机器人 Webhook 地址
+- `WECOM_BOT_ID` / `WECOM_BOT_SECRET`：企业微信智能机器人长连接凭证，用于通过机器人消息增删改查用户
 - `OSS_BUCKET` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_ENDPOINT`：删除 OSS 账号目录所需
+
+## 企业微信智能机器人（长连接）
+
+在智能机器人管理后台开启「API 模式」并选择「长连接」方式，把得到的 `BotID` 和 `Secret` 写入 `.env` 的 `WECOM_BOT_ID` 和 `WECOM_BOT_SECRET`。机器人通过 `wss://openws.work.weixin.qq.com` 建立长连接，`watch` 运行时会自动在后台维护连接（30 秒心跳、断线自动重连）。
+
+在单聊或群聊（@机器人）中发送文字命令即可操作 `USER_FILE`，`watch` 检测到 `USER_FILE` 变化后会立即对账并采集新用户 token。
+
+支持的命令：
+
+```text
+新增 姓名:张三 身份证:440682198001010011
+删除 身份证:440682198001010011
+修改 身份证:旧号码 姓名:新名字 身份证:新号码
+查询
+查询 身份证:440682198001010011
+未学习
+学习状态
+停止 身份证:440682198001010011
+恢复 身份证:440682198001010011
+帮助
+```
+
+说明：
+
+- `新增`/`添加`/`增加`：新增用户；身份证已存在时会返回“已存在”。
+- `删除`/`移除`：按身份证删除用户。
+- `修改`/`更新`：`身份证:` 第一次出现表示原身份证，第二次出现表示新身份证；也可单独修改姓名或 `skip`（如 `skip:true`）。
+- `查询`/`列表`：列出全部用户；带身份证时查询单个用户。
+- `未学习`：列出当前没有在学习的用户（有 `user` 记录、未完成、且无有效 `.process` 运行标记）。
+- `学习状态`：列出全部用户的学习状态（学习中 / 未在学习 / 已完成 / 已跳过）。
+- `停止 身份证:xxx`：向 OSS 写入 `hxacc/account/{idCard}/stop` 标记，integration-harness 检测到后停止该学员的学习进程。
+- `恢复 身份证:xxx`：删除上述 `stop` 标记，学习任务重新恢复。
+- 中文冒号、英文冒号、`=` 均可作为分隔符。
+
+学习状态通过读取 OSS `hxacc/account/{idCard}/` 目录下的标记判断：
+
+- `finished` 存在 → 已完成；
+- `{idCard}.process` 存在且 `expires_at` 未过期 → 学习中；
+- 无 `.process` 或已过期 → 未在学习；
+- `user` 里 `skip: true` → 已跳过。
 
 `USER_FILE` 示例：
 

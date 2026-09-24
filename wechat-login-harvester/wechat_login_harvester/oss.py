@@ -62,6 +62,36 @@ class OssClient:
                 error=f"{type(exc).__name__}: {exc}",
             )
 
+    def object_exists(self, key: str) -> bool:
+        try:
+            return bool(self.bucket.object_exists(key))
+        except Exception:
+            return False
+
+    def list_prefixes(self, prefix: str) -> list[str]:
+        try:
+            result = self.bucket.list_objects(prefix=prefix, delimiter="/")
+            return [
+                item if isinstance(item, str) else item.prefix
+                for item in result.prefix_list
+            ]
+        except Exception:
+            return []
+
+    def get_object_text(self, key: str) -> str:
+        try:
+            result = self.bucket.get_object(key)
+            return result.read().decode("utf-8")
+        except Exception:
+            return ""
+
+    def delete_object(self, key: str) -> bool:
+        try:
+            self.bucket.delete_object(key)
+            return True
+        except Exception:
+            return False
+
     def upload_text(self, key: str, content: str) -> None:
         logger.info("OSS 上传开始：%s", key)
         try:

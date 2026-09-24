@@ -55,6 +55,7 @@ cp .env.example .env
 - `VIDEO_MAX_RETRIES`：视频下载最大重试次数，默认 5
 - `RUN_START_HOUR` / `RUN_END_HOUR`：允许运行时间窗口，默认 5 点到 22 点
 - `WECOM_WEBHOOK_URL`：企业微信机器人 Webhook 地址
+- `WECOM_NOTIFY_TAG`：企业微信通知前缀，默认 `【integration-harness】`
 - `ACCOUNT_DIR`：账户目录，默认 `/Users/liuyingying/simon/work/automation/account`
 - `OSS_BUCKET` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_ENDPOINT`：阿里云 OSS 上传配置
 - `HXACC_SSL_VERIFY`：是否校验真实后端 TLS 证书；当前环境默认设为 `false`，仅在无法验证本地代理证书时使用
@@ -114,6 +115,7 @@ runs/.compensation_queue.jsonl
 扫描逻辑：
 
 - 若 OSS 中存在 `hxacc/account/{idCard}/finished`，推送“已完成”到企业微信。
+- 若 OSS 中存在 `hxacc/account/{idCard}/stop`，视为收到停止指令：终止该账户的学习进程并推送“已停止学习”。
 - 若 OSS 中已存在 `hxacc/account/{idCard}/{idCard}.process`，说明该账户正在处理，跳过并记录日志。
 - `.process` 文件带租约信息，`PROCESS_LEASE_SECONDS` 默认 120 秒；过期后会自动清理并重新接管，避免设备异常退出后永久跳过。
 - OSS 请求连接超时默认 10 秒；单次扫描失败不会退出 watch，会等待下一轮重试，连续失败 3 次会推送企业微信。
@@ -172,9 +174,17 @@ hxacc/account/{idCard}/{pointCode}.json
 `pointCode.json` 包含 `task_id`、`created_at`、`expires_at`、`sha256`。
 其中时间使用 `Asia/Shanghai`（`+08:00`），`sha256` 是 PNG 图片字节内容的 SHA-256，用于防止重扫。
 
-认证等待期间会通过 `/api/mycert/getTaskCert` 检查任务完成状态：根据姓名和身份证号查询列表，匹配 `taskId` 后，`extra.synced=1` 视为已完成；`synced=0` 或缺失则继续观看。若任务一直未完成，等待 30 分钟后会推送企业微信提醒，并自动恢复视频学习。
+每个小节（doc）播放完成后，才通过 `/api/mycert/getTaskCert` 检查课程是否同步完成：匹配 `taskId` 后，`extra.synced=1` 视为已完成；`synced=0` 或缺失则继续定位下一小节观看。本地课程进度 `lp=100` 但只要 `synced != 1`，仍会继续定位 `courseList` 中的课程观看，不会误报“任务已全部看完”。
 
-任务主循环也会优先使用 `getTaskCert` 判断是否同步完成。即使本地课程进度 `lp=100`，只要 `synced != 1`，会继续定位 `courseList` 中的课程观看，不会误报“任务已全部看完”。
+认证等待期间不轮询同步状态，认证通过后恢复播放。若认证未通过，等待 30 分钟后会推送企业微信“认证未通过，已停止学习”通知，并在 OSS 写入 `hxacc/account/{idCard}/stop` 停止标记，终止该账户的学习（不影响其他正在学习的学员）。
+
+解决认证问题后，恢复学习：
+
+```bash
+.venv/bin/python -m integration_harness resume --id-card 440682198210063620
+```
+
+`resume` 会删除该账户的 `stop` 标记并推送“已恢复学习”。watch 模式会在下一轮扫描时自动重新接管该账户；直接 run 模式也可重新运行对应账户文件。
 
 `replay=true` 时，允许选择已经 `finish` 的小节进行重复播放；默认 `false` 跳过已完结小节。
 
@@ -192,6 +202,11 @@ hxacc/account/{idCard}/{pointCode}.json
 8. 当心跳响应出现 `needPoint: true` 和 `qrcodeUrl` 时，暂停课程并打开本地二维码页面。
 9. 测试人员用手机微信扫码。
 10. 页面自动轮询认证结果，成功后恢复学习并继续完成该小节。
+
+学习接口（心跳、课程等）或视频下载返回 401（token 失效）时，会在 OSS 写入
+`hxacc/account/{idCard}/relogin` 重新登录信号并同时写入 `stop` 停止标记（避免
+watch 在重新登录完成前反复重启该账户），由 wechat-login-harvester 的 `watch`
+检测到后自动重新采集 token，成功后删除两个标记恢复学习。
 
 运行过程中会向企业微信推送以下事件：
 

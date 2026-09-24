@@ -52,6 +52,7 @@
   python -m wechat_login_harvester harvest     # 推荐：抓包 + UI 登录
   python -m wechat_login_harvester reconcile   # 清理 skip 用户
   python -m wechat_login_harvester watch       # 持续监控 user 文件变化
+  python -m wechat_login_harvester bot         # 只启动企业微信智能机器人长连接
 
   采集成功后会生成：
 
@@ -63,6 +64,22 @@
 
   hxacc/account/{idCard}/{idCard}.account
   hxacc/account/{idCard}/account.json
+
+如果配置了 `WECOM_BOT_ID` 和 `WECOM_BOT_SECRET`，`watch` 会自动附带企业微信智能机器人长连接；也可用 `bot` 命令单独运行。在单聊或群聊中发送文字命令即可增删改查用户：
+
+```text
+新增 姓名:张三 身份证:440682198001010011
+删除 身份证:440682198001010011
+修改 身份证:旧号码 姓名:新名字 身份证:新号码
+查询
+未学习
+学习状态
+停止 身份证:440682198001010011
+恢复 身份证:440682198001010011
+帮助
+```
+
+`停止` 会向 OSS 写入 `hxacc/account/{idCard}/stop`，`恢复` 会删除该标记；integration-harness 的 `watch` 检测到后分别终止或恢复该学员的学习进程。
 
   ———
 
@@ -107,6 +124,8 @@
 
   runs/<session_id>/run.log
   runs/<session_id>/events.sqlite3
+
+`watch` 守护模式同样会识别 OSS 中的 `finished` 和 `stop` 标记：`finished` 表示该账户已完成，`stop` 表示收到停止指令并终止学习进程。
 
   ———
 

@@ -63,6 +63,12 @@ class _DailyLimitReached(RuntimeError):
         self.already_notified = already_notified
 
 
+class _AuthVerificationFailed(RuntimeError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.already_notified = True
+
+
 class Orchestrator:
     _MAX_RESTART_ATTEMPTS = 3
 
@@ -177,9 +183,6 @@ class Orchestrator:
         skipped_course_ids: set[str] = set()
 
         while True:
-            if self._is_task_completed(task_id):
-                self.logger.info("任务已完成（synced=1）：%s", task_id)
-                break
             course_id = self._next_unfinished_course_id(
                 detail,
                 exclude=skipped_course_ids,
@@ -228,6 +231,12 @@ class Orchestrator:
                     course_id=course_id,
                     course_list_id=course_list_id,
                 )
+                if self._is_task_completed(task_id):
+                    self.logger.info(
+                        "小节完成后检测到任务已同步完成（synced=1）：%s",
+                        task_id,
+                    )
+                    break
                 detail = self._get_task_detail(task_id)
                 if not forced_watch:
                     self._notify_course_completed_if_needed(
@@ -336,7 +345,6 @@ class Orchestrator:
 
         self._set_state("learning")
         self._play_and_heartbeat(
-            task_id=task_id,
             mycourse_id=mycourse_id,
             doc_id=doc_id,
             study_token=study_token,
@@ -385,7 +393,12 @@ class Orchestrator:
             path,
             json.dumps(self._redact_payload(payload), ensure_ascii=False),
         )
-        data = self.client.post_learn_json(path, payload)
+        try:
+            data = self.client.post_learn_json(path, payload)
+        except ApiError as exc:
+            if exc.status_code == 401:
+                self._signal_relogin()
+            raise
         summary = self._summarize(data)
         self._record(
             event_type=event_type,
@@ -699,7 +712,6 @@ class Orchestrator:
     def _play_and_heartbeat(
         self,
         *,
-        task_id: str,
         mycourse_id: str,
         doc_id: str,
         study_token: str,
@@ -782,7 +794,6 @@ class Orchestrator:
 
                 if data.get("needPoint") is True or data.get("code") == 2:
                     self._handle_qr_verification(
-                        task_id=task_id,
                         mycourse_id=mycourse_id,
                         study_token=study_token,
                         trigger_data=data,
@@ -829,6 +840,8 @@ class Orchestrator:
                 retries=self.config.video_max_retries,
             )
         except ApiError as exc:
+            if exc.status_code == 401:
+                self._signal_relogin()
             ok = self.notifier.send_video_download_failed(
                 app_id=self.config.app_id,
                 token_prefix=self.config.token_prefix,
@@ -851,10 +864,29 @@ class Orchestrator:
                 response_text=getattr(exc, "response_text", None),
             ) from exc
 
+    def _signal_relogin(self) -> None:
+        # 401 时同时写 stop，避免 watch 在重新登录完成前反复重启该账户。
+        for suffix, content in (
+            ("relogin", json.dumps({"attempts": 0}, ensure_ascii=False)),
+            ("stop", ""),
+        ):
+            key = f"hxacc/account/{self.id_card}/{suffix}"
+            result = self.oss_uploader.upload_text(key, content)
+            if not result.success:
+                self.logger.warning(
+                    "写入 %s 标记失败 %s：%s",
+                    suffix,
+                    key,
+                    result.error,
+                )
+        self.logger.info(
+            "视频返回 401，已写入重新登录信号和停止标记：%s",
+            self.id_card,
+        )
+
     def _handle_qr_verification(
         self,
         *,
-        task_id: str,
         mycourse_id: str,
         study_token: str,
         trigger_data: dict[str, Any],
@@ -904,21 +936,13 @@ class Orchestrator:
 #         webbrowser.open(page_url)
 
         self._set_state("polling_verification")
-        outcome = self._poll_until_verified(
-            task_id=task_id,
+        self._poll_until_verified(
             mycourse_id=mycourse_id,
             study_token=study_token,
             point_code=point_code,
             qr_state=qr_state,
         )
-
-        if outcome == "completed":
-            self.logger.info("任务已完成，跳过恢复课程")
-            return
-        if outcome == "timeout":
-            self.logger.info("认证等待超时，继续视频学习")
-        else:
-            self.logger.info("认证成功，恢复学习")
+        self.logger.info("认证成功，恢复学习")
 
         self._gd_call(
             "gdResumeCourse",
@@ -1055,12 +1079,11 @@ class Orchestrator:
     def _poll_until_verified(
         self,
         *,
-        task_id: str,
         mycourse_id: str,
         study_token: str,
         point_code: str,
         qr_state: QRPageState,
-    ) -> str:
+    ) -> None:
         poll_seconds = self.config.verify_poll_interval_seconds
         deadline = time.monotonic() + (30 * 60)
         while True:
@@ -1071,24 +1094,23 @@ class Orchestrator:
                 point_code=point_code,
             )
             data = self._coerce_data(result)
-            if self._is_task_completed(task_id):
-                qr_state.verify_status = "VERIFIED"
-                qr_state.message = "任务已完成，无需继续认证。"
-                return "completed"
             verify_result = data.get("verifyResult")
             if verify_result in ("1", 1, True):
                 qr_state.verify_status = "VERIFIED"
                 qr_state.message = "认证成功，可以继续恢复学习。"
-                return "verified"
+                return
 
             if time.monotonic() >= deadline:
                 qr_state.verify_status = "PENDING"
-                qr_state.message = "认证等待超时，继续视频学习。"
-                self._notify_verification_timeout(
+                qr_state.message = "认证未通过，停止学习。"
+                self._notify_verification_failed(
                     point_code=point_code,
                     waited_seconds=30 * 60,
                 )
-                return "timeout"
+                self._mark_account_stopped()
+                raise _AuthVerificationFailed(
+                    "认证未通过，等待 30 分钟超时，停止学习"
+                )
 
             qr_state.verify_status = "PENDING"
             qr_state.message = "等待扫码认证"
@@ -1183,7 +1205,17 @@ class Orchestrator:
     def _is_learned_complete(cls, data: dict[str, Any]) -> bool:
         return cls._data_learned_status(data) == 2
 
-    def _notify_verification_timeout(
+    def _mark_account_stopped(self) -> None:
+        key = f"hxacc/account/{self.id_card}/stop"
+        result = self.oss_uploader.upload_text(key, "")
+        if not result.success:
+            self.logger.warning(
+                "写入停止标记失败 %s：%s",
+                key,
+                result.error,
+            )
+
+    def _notify_verification_failed(
         self,
         *,
         point_code: str,
@@ -1191,7 +1223,7 @@ class Orchestrator:
     ) -> None:
         content = "\n".join(
             [
-                "⚠️ 认证等待超时",
+                "🚫 认证未通过，已停止学习",
                 "",
                 f"时间：{datetime.now(CN_TZ):%Y-%m-%d %H:%M:%S}",
                 f"idCard：{self.id_card}",
@@ -1199,12 +1231,13 @@ class Orchestrator:
                 f"pointCode：{point_code}",
                 f"已等待：{waited_seconds // 60} 分钟",
                 "",
-                "系统继续视频学习。",
+                "请解决认证问题后恢复学习：",
+                f".venv/bin/python -m integration_harness resume --id-card {self.id_card}",
             ]
         )
         ok = self.notifier.send_markdown(content)
         if not ok:
-            self.logger.warning("认证超时企业微信推送失败，已写入本地待发队列")
+            self.logger.warning("认证未通过的企业微信推送失败，已写入本地待发队列")
 
     @staticmethod
     def _response_status_message(data: dict[str, Any]) -> str:

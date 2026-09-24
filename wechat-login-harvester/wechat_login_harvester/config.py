@@ -28,6 +28,8 @@ class Config:
     oss_endpoint: str
     watch_interval_seconds: float
     wecom_webhook_url: str = ""
+    wecom_bot_id: str = ""
+    wecom_bot_secret: str = ""
     login_logout_delay_seconds: float = 30.0
 
 
@@ -137,6 +139,8 @@ def load_config() -> Config:
             "WECOM_WEBHOOK_URL",
             "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=de2d8b32-ca95-4117-b349-816feb0347d2",
         ).strip(),
+        wecom_bot_id=os.getenv("WECOM_BOT_ID", "").strip(),
+        wecom_bot_secret=os.getenv("WECOM_BOT_SECRET", "").strip(),
         login_logout_delay_seconds=float(
             os.getenv("LOGIN_LOGOUT_DELAY_SECONDS", "30")
         ),

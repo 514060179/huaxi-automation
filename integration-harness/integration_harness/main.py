@@ -33,7 +33,16 @@ COMPENSATION_LOCK = threading.Lock()
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Real-environment normal-path integration harness")
-    parser.add_argument("command", choices=["run", "watch"], help="Command to execute")
+    parser.add_argument(
+        "command",
+        choices=["run", "watch", "resume"],
+        help="Command to execute",
+    )
+    parser.add_argument(
+        "--id-card",
+        default=None,
+        help="Account idCard, required by the resume command",
+    )
     parser.add_argument(
         "--account-dir",
         default=os.getenv(
@@ -479,6 +488,7 @@ def _watch_accounts(account_dir: Path) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     watched: dict[str, tuple[subprocess.Popen, object, object]] = {}
     finished_notified: set[str] = set()
+    stop_notified: set[str] = set()
     expired_notified: set[str] = set()
     process_ttl_seconds = int(os.getenv("PROCESS_LEASE_SECONDS", "120"))
     last_renew: dict[str, float] = {}
@@ -486,6 +496,9 @@ def _watch_accounts(account_dir: Path) -> int:
 
     def process_key(id_card: str) -> str:
         return f"hxacc/account/{id_card}/{id_card}.process"
+
+    def stop_key(id_card: str) -> str:
+        return f"hxacc/account/{id_card}/stop"
 
     def notify_process_file_failure(action: str, key: str, error: str) -> None:
         notifier.send_markdown(
@@ -619,6 +632,24 @@ def _watch_accounts(account_dir: Path) -> int:
                                 )
                             )
                             finished_notified.add(id_card)
+                        continue
+
+                    if uploader.object_exists(stop_key(id_card)):
+                        if id_card in watched:
+                            stop_one(id_card)
+                        elif uploader.object_exists(process_key(id_card)):
+                            delete_process_file(id_card)
+                        if id_card not in stop_notified:
+                            notifier.send_markdown(
+                                "\n".join(
+                                    [
+                                        "⏹️ 已停止学习（收到停止指令）",
+                                        f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                                        f"idCard：{id_card}",
+                                    ]
+                                )
+                            )
+                            stop_notified.add(id_card)
                         continue
 
                     account_path = account_dir / f"{id_card}.account"
@@ -765,12 +796,55 @@ def _prepare_accounts(accounts: list[Account]) -> tuple[list[_PreparedAccount], 
     return prepared, exit_code
 
 
+def _resume_account(id_card: str) -> int:
+    config = load_config(
+        {
+            "HXACC_TOKEN": "resume-mode",
+            "HXACC_DEVICE_ID": "resume-mode",
+        }
+    )
+    uploader = OssAccountUploader(
+        access_key_id=config.oss_access_key_id,
+        access_key_secret=config.oss_access_key_secret,
+        bucket_name=config.oss_bucket,
+        endpoint=config.oss_endpoint,
+    )
+    stop_key = f"hxacc/account/{id_card}/stop"
+    if not uploader.object_exists(stop_key):
+        print(f"账户 {id_card} 没有停止标记，无需恢复", file=sys.stderr)
+        return 0
+    result = uploader.delete_object(stop_key)
+    if not result.success:
+        print(f"删除停止标记失败 {stop_key}: {result.error}", file=sys.stderr)
+        return 1
+
+    print(f"已删除停止标记 {stop_key}，账户 {id_card} 恢复学习")
+    notifier = WeChatNotifier(config.wecom_webhook_url)
+    notifier.send_markdown(
+        "\n".join(
+            [
+                "✅ 已恢复学习",
+                f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                f"idCard：{id_card}",
+            ]
+        )
+    )
+    notifier.close()
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "watch":
         return _watch_accounts(Path(args.account_dir))
+
+    if args.command == "resume":
+        if not args.id_card:
+            print("resume 命令需要 --id-card 参数", file=sys.stderr)
+            return 2
+        return _resume_account(args.id_card)
 
     if args.account_file:
         try:

@@ -7,10 +7,12 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
+from .bot import UserStore, start_bot_thread
 from .config import load_config
 from .login import LoginRunner
 from .oss import OssClient
@@ -23,6 +25,10 @@ DEFAULT_WECOM_WEBHOOK_URL = (
     "?key=de2d8b32-ca95-4117-b349-816feb0347d2"
 )
 
+RELOGIN_MAX_ATTEMPTS = 2
+# ponytail: hardcoded retry cooldown; make configurable if operators need it.
+RELOGIN_COOLDOWN_SECONDS = 300
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -34,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("harvest", help="Start capture proxy and run login")
     sub.add_parser("reconcile", help="Reconcile user file with accounts/OSS")
     sub.add_parser("watch", help="Watch user file and reconcile changes")
+    sub.add_parser("bot", help="Run WeCom intelligent-bot long connection only")
     return parser
 
 
@@ -398,30 +405,178 @@ def _command_reconcile(config, notifier: WeChatNotifier | None) -> int:
     return 0
 
 
-def _command_watch(config, notifier: WeChatNotifier | None) -> int:
-    last_hash = _user_file_hash(config)
-    print(f"开始监控 {config.user_file}，间隔 {config.watch_interval_seconds}s")
-    while True:
-        time.sleep(config.watch_interval_seconds)
+def _relogin_signal_key(id_card: str) -> str:
+    return f"hxacc/account/{id_card}/relogin"
+
+
+def _stop_key(id_card: str) -> str:
+    return f"hxacc/account/{id_card}/stop"
+
+
+def _list_account_ids(oss) -> list[str]:
+    ids: list[str] = []
+    for prefix in oss.list_prefixes("hxacc/account/"):
+        stripped = prefix.rstrip("/")
+        if not stripped.startswith("hxacc/account/"):
+            continue
+        id_card = stripped.rsplit("/", 1)[-1]
+        if id_card:
+            ids.append(id_card)
+    return ids
+
+
+def _relogin_user(config, user, notifier) -> bool:
+    account_path = config.account_dir / f"{user.id_card}.account"
+    before = account_path.stat().st_mtime if account_path.exists() else 0.0
+    try:
+        _harvest_users(config, [user], notifier)
+    except Exception as exc:
+        _notify_failure(
+            notifier,
+            "重新登录执行失败",
+            details={**_user_details(user), "异常": f"{type(exc).__name__}: {exc}"},
+        )
+    after = account_path.stat().st_mtime if account_path.exists() else 0.0
+    return after > before
+
+
+def _poll_relogin_signals(config, oss, notifier) -> None:
+    if oss is None:
+        return
+    for id_card in _list_account_ids(oss):
+        key = _relogin_signal_key(id_card)
+        if not oss.object_exists(key):
+            continue
+
+        raw = oss.get_object_text(key)
+        attempts = 0
+        last_attempt_at = 0.0
         try:
-            new_config = load_config()
-        except Exception as exc:
-            print(f"配置读取失败：{exc}", file=sys.stderr)
+            data = json.loads(raw) if raw.strip() else {}
+            attempts = int(data.get("attempts", 0))
+            last_attempt_at = float(data.get("last_attempt_at", 0) or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+        user = next((u for u in config.users if u.id_card == id_card), None)
+        if user is None or user.skip:
+            oss.delete_object(key)
+            continue
+        if time.time() - last_attempt_at < RELOGIN_COOLDOWN_SECONDS:
+            continue
+
+        if _relogin_user(config, user, notifier):
+            oss.delete_object(key)
+            oss.delete_object(_stop_key(id_card))
+            continue
+
+        attempts += 1
+        if attempts > RELOGIN_MAX_ATTEMPTS:
             _notify_failure(
                 notifier,
-                "用户文件配置读取失败",
-                details={"异常": f"{type(exc).__name__}: {exc}"},
+                "重新登录超过 2 次仍失败，请马上修复",
+                details={**_user_details(user), "已尝试": str(attempts)},
             )
-            continue
-        new_hash = _user_file_hash(new_config)
-        if new_hash == last_hash:
-            continue
-        last_hash = new_hash
-        result = reconcile(new_config)
-        _print_reconcile_result(result, notifier)
-        if result.to_harvest:
-            _harvest_users(new_config, result.to_harvest, notifier)
-        config = new_config
+            oss.delete_object(key)
+        else:
+            oss.upload_text(
+                key,
+                json.dumps(
+                    {"attempts": attempts, "last_attempt_at": time.time()},
+                    ensure_ascii=False,
+                ),
+            )
+
+
+def _command_watch(config, notifier: WeChatNotifier | None) -> int:
+    stop_event = threading.Event()
+    bot_thread = None
+    oss = _make_oss_client(config)
+    if config.wecom_bot_id and config.wecom_bot_secret:
+        bot_thread = start_bot_thread(
+            bot_id=config.wecom_bot_id,
+            secret=config.wecom_bot_secret,
+            store=UserStore(config.user_file),
+            stop_event=stop_event,
+            oss=oss,
+        )
+        print(
+            f"已启动企业微信机器人长连接（监听 {config.user_file} 的 user 变更）"
+        )
+    else:
+        print(
+            "未配置 WECOM_BOT_ID/WECOM_BOT_SECRET，跳过企业微信机器人长连接",
+            file=sys.stderr,
+        )
+
+    last_hash = _user_file_hash(config)
+    print(f"开始监控 {config.user_file}，间隔 {config.watch_interval_seconds}s")
+    try:
+        while True:
+            time.sleep(config.watch_interval_seconds)
+            try:
+                new_config = load_config()
+            except Exception as exc:
+                print(f"配置读取失败：{exc}", file=sys.stderr)
+                _notify_failure(
+                    notifier,
+                    "用户文件配置读取失败",
+                    details={"异常": f"{type(exc).__name__}: {exc}"},
+                )
+                continue
+            _poll_relogin_signals(new_config, oss, notifier)
+            new_hash = _user_file_hash(new_config)
+            if new_hash == last_hash:
+                continue
+            last_hash = new_hash
+            result = reconcile(new_config)
+            _print_reconcile_result(result, notifier)
+            if result.to_harvest:
+                _harvest_users(new_config, result.to_harvest, notifier)
+            config = new_config
+    finally:
+        stop_event.set()
+        if bot_thread is not None:
+            bot_thread.join(timeout=3)
+
+
+def _command_bot(config, notifier: WeChatNotifier | None) -> int:
+    if not config.wecom_bot_id or not config.wecom_bot_secret:
+        _notify_failure(
+            notifier,
+            "企业微信机器人配置缺失",
+            details={"提示": "请在 .env 中配置 WECOM_BOT_ID 和 WECOM_BOT_SECRET"},
+        )
+        return 1
+    stop_event = threading.Event()
+    thread = start_bot_thread(
+        bot_id=config.wecom_bot_id,
+        secret=config.wecom_bot_secret,
+        store=UserStore(config.user_file),
+        stop_event=stop_event,
+        oss=_make_oss_client(config),
+    )
+    print(
+        f"企业微信机器人长连接已启动，监听 {config.user_file} 的 user 变更"
+    )
+    try:
+        while thread.is_alive():
+            thread.join(timeout=1)
+    except KeyboardInterrupt:
+        stop_event.set()
+        thread.join(timeout=3)
+    return 0
+
+
+def _make_oss_client(config):
+    if not (config.oss_bucket and config.oss_access_key_id and config.oss_access_key_secret):
+        return None
+    return OssClient(
+        access_key_id=config.oss_access_key_id,
+        access_key_secret=config.oss_access_key_secret,
+        bucket_name=config.oss_bucket,
+        endpoint=config.oss_endpoint,
+    )
 
 
 def main() -> int:
@@ -457,6 +612,8 @@ def main() -> int:
             return _command_reconcile(config, notifier)
         if args.command == "watch":
             return _command_watch(config, notifier)
+        if args.command == "bot":
+            return _command_bot(config, notifier)
     except Exception as exc:
         _notify_failure(
             notifier,
