@@ -89,12 +89,21 @@ def capture_window(window: MiniProgramWindow, path: Path) -> Path:
         f"{window.bounds.x},{window.bounds.y},"
         f"{window.bounds.width},{window.bounds.height}"
     )
-    subprocess.run(
-        ["screencapture", "-x", "-R", region, str(path)],
-        check=True,
-        capture_output=True,
-    )
-    return path
+    cmd = ["screencapture", "-x", "-R", region, str(path)]
+    last_error = ""
+    for _ in range(3):
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return path
+        except subprocess.CalledProcessError as exc:
+            last_error = (exc.stderr or "").strip() or str(exc)
+            time.sleep(1)
+    raise RuntimeError(f"屏幕截图失败：{last_error}")
 
 
 def recognize_text(path: Path) -> list[TextObservation]:

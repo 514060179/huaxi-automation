@@ -449,10 +449,15 @@ def _poll_relogin_signals(config, oss, notifier) -> None:
             continue
 
         raw = oss.get_object_text(key)
+        if not raw.strip():
+            # object_exists 与 get_object 之间存在竞态：信号刚被别的进程消费掉，
+            # get_object 会抛 404（NoSuchKey）并被 get_object_text 吞成空串。
+            # 按“无信号”跳过，避免对同一账号重复登录。
+            continue
         attempts = 0
         last_attempt_at = 0.0
         try:
-            data = json.loads(raw) if raw.strip() else {}
+            data = json.loads(raw)
             attempts = int(data.get("attempts", 0))
             last_attempt_at = float(data.get("last_attempt_at", 0) or 0)
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -585,6 +590,9 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # oss2 会把每个 HTTP 错误（含预期的 404 NoSuchKey）以 INFO 打到 oss2.api，
+    # 这里只保留 WARNING 及以上，避免刷屏；真正的错误仍会通过异常/我们自己的日志暴露。
+    logging.getLogger("oss2.api").setLevel(logging.WARNING)
     try:
         config = load_config()
     except Exception as exc:
