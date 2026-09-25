@@ -521,17 +521,17 @@ def _stop_watched_process(
 
 def _watch_accounts(account_dir: Path) -> int:
     account_dir = account_dir.expanduser()
-    interval = float(os.getenv("ACCOUNT_WATCH_INTERVAL_SECONDS", "2"))
-    slot_count = int(os.getenv("ACCOUNT_SLOT_COUNT", "16"))
-    worker_id = os.getenv("WORKER_ID", "device-01")
-    active_worker_ids: list[str] = []
-    my_worker_index = -1
     config = load_config(
         {
             "HXACC_TOKEN": "watch-mode",
             "HXACC_DEVICE_ID": "watch-mode",
         }
     )
+    interval = float(os.getenv("ACCOUNT_WATCH_INTERVAL_SECONDS", "2"))
+    slot_count = int(os.getenv("ACCOUNT_SLOT_COUNT", "16"))
+    worker_id = os.getenv("WORKER_ID", "device-01")
+    active_worker_ids: list[str] = []
+    my_worker_index = -1
     notifier = WeChatNotifier(
         config.wecom_webhook_url,
         outbox_path=config.runs_dir / ".wecom_outbox.jsonl",

@@ -1,9 +1,12 @@
+import os
+
 import pytest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 from integration_harness.accounts import Account
+from integration_harness.config import load_config
 from integration_harness.main import (
     _account_slot,
     _account_file_paths,
@@ -117,6 +120,16 @@ def test_ensure_account_file_pulls_from_oss_when_local_missing(tmp_path):
 
     assert _ensure_account_file(FakeUploader(error=True), tmp_path, "id-3") is None
     assert _ensure_account_file(FakeUploader("   "), tmp_path, "id-4") is None
+
+
+def test_load_config_populates_dotenv_worker_id(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORKER_ID", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("WORKER_ID=device-02\n", encoding="utf-8")
+
+    load_config({"HXACC_TOKEN": "t", "HXACC_DEVICE_ID": "d"})
+
+    assert os.getenv("WORKER_ID") == "device-02"
 
 
 def test_is_in_run_window_respects_hours():
