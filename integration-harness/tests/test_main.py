@@ -9,6 +9,7 @@ from integration_harness.main import (
     _account_file_paths,
     _append_compensation,
     _compensation_sources,
+    _ensure_account_file,
     _is_in_run_window,
     _oss_worker_ids,
     _prepare_accounts,
@@ -89,6 +90,33 @@ def test_oss_worker_ids_parses_dedupes_and_rejects_bad_input():
     assert _oss_worker_ids(FakeUploader("{}")) is None
     assert _oss_worker_ids(FakeUploader("[]")) is None
     assert _oss_worker_ids(FakeUploader()) is None
+
+
+def test_ensure_account_file_pulls_from_oss_when_local_missing(tmp_path):
+    class FakeUploader:
+        def __init__(self, content=None, error=False):
+            self._content = content
+            self._error = error
+
+        def get_object_text(self, key):
+            if self._error:
+                raise RuntimeError("NoSuchKey")
+            return self._content
+
+    path = _ensure_account_file(
+        FakeUploader('{"token": "t"}'), tmp_path, "id-1"
+    )
+    assert path == tmp_path / "id-1.account"
+    assert path.read_text() == '{"token": "t"}'
+
+    (tmp_path / "id-2.account").write_text("local", encoding="utf-8")
+    path = _ensure_account_file(
+        FakeUploader('{"token": "oss"}'), tmp_path, "id-2"
+    )
+    assert path.read_text() == "local"
+
+    assert _ensure_account_file(FakeUploader(error=True), tmp_path, "id-3") is None
+    assert _ensure_account_file(FakeUploader("   "), tmp_path, "id-4") is None
 
 
 def test_is_in_run_window_respects_hours():

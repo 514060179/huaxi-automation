@@ -459,6 +459,27 @@ def _token_expired(account_path: Path) -> bool:
     return datetime.now().timestamp() >= float(expires_at)
 
 
+def _ensure_account_file(
+    uploader: OssAccountUploader,
+    account_dir: Path,
+    id_card: str,
+) -> Path | None:
+    account_path = account_dir / f"{id_card}.account"
+    if account_path.exists():
+        return account_path
+    try:
+        content = uploader.get_object_text(
+            f"hxacc/account/{id_card}/{id_card}.account"
+        )
+    except Exception:
+        content = ""
+    if not content.strip():
+        return None
+    account_path.parent.mkdir(parents=True, exist_ok=True)
+    account_path.write_text(content, encoding="utf-8")
+    return account_path
+
+
 def _account_slot(id_card: str, slot_count: int) -> int:
     digest = hashlib.sha256(id_card.encode("utf-8")).hexdigest()
     return int(digest, 16) % slot_count
@@ -708,9 +729,15 @@ def _watch_accounts(account_dir: Path) -> int:
                             stop_notified.add(id_card)
                         continue
 
-                    account_path = account_dir / f"{id_card}.account"
-                    if not account_path.exists():
-                        print(f"本地账户文件不存在：{account_path}", file=sys.stderr)
+                    account_path = _ensure_account_file(
+                        uploader, account_dir, id_card
+                    )
+                    if account_path is None:
+                        print(
+                            f"本地账户文件不存在且 OSS 无副本："
+                            f"{account_dir / f'{id_card}.account'}",
+                            file=sys.stderr,
+                        )
                         continue
 
                     if uploader.object_exists(process_key(id_card)):
