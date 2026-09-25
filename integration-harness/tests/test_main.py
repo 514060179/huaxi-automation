@@ -10,6 +10,7 @@ from integration_harness.main import (
     _append_compensation,
     _compensation_sources,
     _is_in_run_window,
+    _oss_worker_ids,
     _prepare_accounts,
     _remove_compensation,
     _resume_account,
@@ -53,6 +54,41 @@ def test_parser_accepts_resume_and_id_card():
     args = parser.parse_args(["resume", "--id-card", "id-1"])
     assert args.command == "resume"
     assert args.id_card == "id-1"
+
+
+def test_parser_accepts_workers_command():
+    parser = build_parser()
+    args = parser.parse_args(["workers", "--list"])
+    assert args.command == "workers"
+    assert args.list is True
+
+    args = parser.parse_args(
+        ["workers", "--add", "device-03", "--remove", "device-02"]
+    )
+    assert args.add == ["device-03"]
+    assert args.remove == ["device-02"]
+
+    args = parser.parse_args(["workers", "--set", "device-01", "device-02"])
+    assert args.set == ["device-01", "device-02"]
+
+
+def test_oss_worker_ids_parses_dedupes_and_rejects_bad_input():
+    class FakeUploader:
+        def __init__(self, content=None):
+            self._content = content
+
+        def get_object_text(self, key):
+            if self._content is None:
+                raise RuntimeError("NoSuchKey")
+            return self._content
+
+    assert _oss_worker_ids(
+        FakeUploader('["device-02", "device-01", "device-02"]')
+    ) == ["device-01", "device-02"]
+    assert _oss_worker_ids(FakeUploader("not json")) is None
+    assert _oss_worker_ids(FakeUploader("{}")) is None
+    assert _oss_worker_ids(FakeUploader("[]")) is None
+    assert _oss_worker_ids(FakeUploader()) is None
 
 
 def test_is_in_run_window_respects_hours():

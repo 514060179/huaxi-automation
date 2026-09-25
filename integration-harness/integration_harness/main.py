@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Real-environment normal-path integration harness")
     parser.add_argument(
         "command",
-        choices=["run", "watch", "resume"],
+        choices=["run", "watch", "resume", "workers"],
         help="Command to execute",
     )
     parser.add_argument(
@@ -66,6 +66,32 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.getenv("MAX_PARALLEL_ACCOUNTS", "3")),
         help="Maximum number of accounts to run in parallel",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List worker IDs (workers command)",
+    )
+    parser.add_argument(
+        "--add",
+        action="append",
+        default=[],
+        metavar="WORKER_ID",
+        help="Add worker IDs to the shared list (workers command)",
+    )
+    parser.add_argument(
+        "--remove",
+        action="append",
+        default=[],
+        metavar="WORKER_ID",
+        help="Remove worker IDs from the shared list (workers command)",
+    )
+    parser.add_argument(
+        "--set",
+        nargs="+",
+        default=None,
+        metavar="WORKER_ID",
+        help="Replace the shared worker list (workers command)",
     )
     return parser
 
@@ -438,6 +464,24 @@ def _account_slot(id_card: str, slot_count: int) -> int:
     return int(digest, 16) % slot_count
 
 
+WORKERS_KEY = "hxacc/workers"
+
+
+def _oss_worker_ids(uploader: OssAccountUploader) -> list[str] | None:
+    try:
+        raw = uploader.get_object_text(WORKERS_KEY).strip()
+    except Exception:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    ids = sorted({str(item).strip() for item in data if str(item).strip()})
+    return ids or None
+
+
 def _stop_watched_process(
     proc: subprocess.Popen,
     stdout_file,
@@ -459,15 +503,8 @@ def _watch_accounts(account_dir: Path) -> int:
     interval = float(os.getenv("ACCOUNT_WATCH_INTERVAL_SECONDS", "2"))
     slot_count = int(os.getenv("ACCOUNT_SLOT_COUNT", "16"))
     worker_id = os.getenv("WORKER_ID", "device-01")
-    active_worker_ids = [
-        item.strip()
-        for item in os.getenv("WORKER_IDS", worker_id).split(",")
-        if item.strip()
-    ]
-    if worker_id not in active_worker_ids:
-        active_worker_ids.append(worker_id)
-    active_worker_ids = sorted(active_worker_ids)
-    my_worker_index = active_worker_ids.index(worker_id)
+    active_worker_ids: list[str] = []
+    my_worker_index = -1
     config = load_config(
         {
             "HXACC_TOKEN": "watch-mode",
@@ -603,6 +640,25 @@ def _watch_accounts(account_dir: Path) -> int:
         consecutive_oss_failures = 0
         while True:
             try:
+                # 每轮从 OSS 重读节点名单，实现扩缩容热加载；读不到沿用上一轮结果。
+                remote_ids = _oss_worker_ids(uploader)
+                if remote_ids is not None:
+                    active_worker_ids = remote_ids
+                elif not active_worker_ids:
+                    ids = [
+                        item.strip()
+                        for item in os.getenv("WORKER_IDS", worker_id).split(",")
+                        if item.strip()
+                    ]
+                    if worker_id not in ids:
+                        ids.append(worker_id)
+                    active_worker_ids = sorted(set(ids))
+                my_worker_index = (
+                    active_worker_ids.index(worker_id)
+                    if worker_id in active_worker_ids
+                    else -1
+                )
+
                 prefixes = uploader.list_prefixes("hxacc/account/")
                 current_ids = {
                     prefix.rstrip("/").rsplit("/", 1)[-1]
@@ -685,6 +741,17 @@ def _watch_accounts(account_dir: Path) -> int:
                     if id_card not in watched:
                         if create_process_file(id_card):
                             start_one(id_card, account_path)
+
+                # 热加载交接：不再归本机管理的账号停掉并清租约，让新 owner 接管；
+                # 本机被移出名单时（my_worker_index < 0）清空所有子进程转 standby。
+                for id_card in list(watched):
+                    owned = (
+                        my_worker_index >= 0
+                        and _account_slot(id_card, slot_count) % len(active_worker_ids)
+                        == my_worker_index
+                    )
+                    if not owned:
+                        stop_one(id_card)
 
                 for id_card in list(watched):
                     if id_card not in current_ids:
@@ -833,12 +900,51 @@ def _resume_account(id_card: str) -> int:
     return 0
 
 
+def _workers_command(args) -> int:
+    config = load_config(
+        {
+            "HXACC_TOKEN": "workers-mode",
+            "HXACC_DEVICE_ID": "workers-mode",
+        }
+    )
+    uploader = OssAccountUploader(
+        access_key_id=config.oss_access_key_id,
+        access_key_secret=config.oss_access_key_secret,
+        bucket_name=config.oss_bucket,
+        endpoint=config.oss_endpoint,
+    )
+    current = _oss_worker_ids(uploader) or []
+    if args.list:
+        if current:
+            print("\n".join(current))
+        else:
+            print("(未设置节点名单)", file=sys.stderr)
+        return 0
+    if args.set:
+        new = sorted({item.strip() for item in args.set if item.strip()})
+    else:
+        new = sorted(set(current) | {item.strip() for item in args.add if item.strip()})
+        new = sorted(set(new) - {item.strip() for item in args.remove if item.strip()})
+    if not new:
+        print("节点名单不能为空", file=sys.stderr)
+        return 2
+    result = uploader.upload_text(WORKERS_KEY, json.dumps(new, ensure_ascii=False))
+    if not result.success:
+        print(f"更新节点名单失败：{result.error}", file=sys.stderr)
+        return 1
+    print(f"节点名单已更新：{', '.join(new)}")
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
     if args.command == "watch":
         return _watch_accounts(Path(args.account_dir))
+
+    if args.command == "workers":
+        return _workers_command(args)
 
     if args.command == "resume":
         if not args.id_card:

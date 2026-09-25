@@ -128,21 +128,18 @@ runs/.compensation_queue.jsonl
 
 - `ACCOUNT_SLOT_COUNT`：固定槽位数，默认 16。
 - `WORKER_ID`：当前设备 ID，默认 `device-01`。
-- `WORKER_IDS`：参与调度的设备 ID 列表，逗号分隔。
+- 节点名单存在 OSS `hxacc/workers`，`watch` 每轮扫描重读，扩缩容热加载。
 
-每台设备只处理哈希后属于自己槽位的账户。当前只有一台设备时：
-
-```bash
-WORKER_ID=device-01
-WORKER_IDS=device-01
-```
-
-未来增加一台设备时，第二台配置：
+每台设备只处理哈希后属于自己槽位的账户。修改节点名单：
 
 ```bash
-WORKER_ID=device-02
-WORKER_IDS=device-01,device-02
+.venv/bin/python -m integration_harness workers --list
+.venv/bin/python -m integration_harness workers --add device-02     # 扩容
+.venv/bin/python -m integration_harness workers --remove device-02  # 缩容
 ```
+
+新增节点只需在 `.env` 里设好自己的 `WORKER_ID`，然后启动 `watch`；名单尚未在 OSS 建立
+时，会 fallback 到 `WORKER_IDS` 环境变量（逗号分隔）。
 
 ```text
 runs/watch/{idCard}.out.log
