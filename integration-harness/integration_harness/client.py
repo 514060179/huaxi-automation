@@ -93,24 +93,31 @@ class HxaccClient:
 
     def post_learn_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.config.learn_base_url}{path}"
-        response = self.client.post(
-            url,
-            json=payload,
-            headers={
-                **self.learn_headers,
-                "Content-Type": "application/json",
-                "xweb_xhr": "1",
-            },
-        )
-        self._raise_for_status(response, context=f"POST {path}")
-        try:
-            return response.json()
-        except json.JSONDecodeError as exc:
-            raise ApiError(
-                f"POST {path} returned non-JSON body",
-                status_code=response.status_code,
-                response_text=response.text[:500],
-            ) from exc
+        headers = {
+            **self.learn_headers,
+            "Content-Type": "application/json",
+            "xweb_xhr": "1",
+        }
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self.client.post(url, json=payload, headers=headers)
+            except httpx.TransportError as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(min(2 ** attempt, 5))
+                    continue
+                raise ApiError(f"POST {path} failed: {exc}") from exc
+            self._raise_for_status(response, context=f"POST {path}")
+            try:
+                return response.json()
+            except json.JSONDecodeError as exc:
+                raise ApiError(
+                    f"POST {path} returned non-JSON body",
+                    status_code=response.status_code,
+                    response_text=response.text[:500],
+                ) from exc
+        raise ApiError(f"POST {path} failed after retries: {last_error}")
 
     def post_www_form(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.config.www_base_url}{path}"

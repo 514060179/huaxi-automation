@@ -203,6 +203,7 @@ class Orchestrator:
                 if forced_watch:
                     course_list_id = forced_course_list_id
                     course_title = course_id
+                    doc_id = ""
                     self.logger.info(
                         "任务未同步，继续观看课程：%s",
                         course_id,
@@ -217,7 +218,7 @@ class Orchestrator:
                         course_list_id,
                         course_ids,
                     )
-                    course_info, _ = self._select_course_and_doc(
+                    course_info, doc_id = self._select_course_and_doc(
                         course_list,
                         course_id=course_id,
                     )
@@ -230,6 +231,7 @@ class Orchestrator:
                     task_id=task_id,
                     course_id=course_id,
                     course_list_id=course_list_id,
+                    doc_id=doc_id or None,
                 )
                 if self._is_task_completed(task_id):
                     self.logger.info(
@@ -288,6 +290,7 @@ class Orchestrator:
         task_id: str,
         course_id: str,
         course_list_id: str,
+        doc_id: str | None = None,
     ) -> None:
         post_learn = self._post_json(
             "/api/mytask/postLearnCourse",
@@ -306,7 +309,7 @@ class Orchestrator:
             "/api/mycourse/getMycourseDetail",
             {
                 "mycourseId": mycourse_id,
-                "docId": None,
+                "docId": doc_id,
                 "platform": "minapp",
                 "appId": self.config.app_id,
             },
@@ -316,6 +319,11 @@ class Orchestrator:
         self.logger.info("当前小节：%s", doc_id)
         random_value = self._find_random(course_detail, doc_id)
         target_seconds = self._find_target_seconds(course_detail, doc_id)
+        resume_seconds = (
+            0
+            if getattr(self, "replay", False)
+            else self._find_learned_seconds(course_detail, doc_id)
+        )
 
         point_state = self._gd_call(
             "gdGetPointState",
@@ -353,6 +361,7 @@ class Orchestrator:
             point_code=point_code,
             qrcode_url=qrcode_url,
             target_seconds=target_seconds,
+            resume_seconds=resume_seconds,
         )
 
     def _set_state(self, state: str) -> None:
@@ -529,6 +538,9 @@ class Orchestrator:
             course_list_id = course_config.get("id") or course_config.get("_id")
             if not course_list_id:
                 continue
+            flat_course_ids = course_config.get("courseIds") or []
+            if course_id in flat_course_ids:
+                return course_list_id, [course_id]
             for group in course_config.get("courseGroup") or []:
                 course_ids = group.get("courseIds") or []
                 if course_id in course_ids:
@@ -567,6 +579,30 @@ class Orchestrator:
                 return duration_int
 
         raise RuntimeError("找不到该小节的总学习时长")
+
+    def _find_learned_seconds(
+        self,
+        course_detail: dict[str, Any],
+        doc_id: str,
+    ) -> int:
+        learned = (
+            course_detail.get("data", {})
+            .get("mycourseInfo", {})
+            .get("learned")
+            or {}
+        )
+        doc_state = learned.get(doc_id) or {}
+        for key in ("learnedTime", "lastTime"):
+            value = doc_state.get(key)
+            if value is None:
+                continue
+            try:
+                value_int = int(value)
+            except (TypeError, ValueError):
+                value_int = 0
+            if value_int > 0:
+                return value_int
+        return 0
 
     def _resolve_current_doc_id(
         self,
@@ -720,6 +756,7 @@ class Orchestrator:
         point_code: str,
         qrcode_url: str | None = None,
         target_seconds: int,
+        resume_seconds: int = 0,
     ) -> None:
         interval = self.config.heartbeat_interval_seconds
         start_monotonic = time.monotonic()
@@ -749,8 +786,8 @@ class Orchestrator:
 
             if next_heartbeat_at <= time.monotonic():
                 elapsed_seconds = max(0, int(time.monotonic() - start_monotonic))
-                final_heartbeat = elapsed_seconds >= target_seconds
-                reported_seconds = min(elapsed_seconds, target_seconds)
+                reported_seconds = min(resume_seconds + elapsed_seconds, target_seconds)
+                final_heartbeat = resume_seconds + elapsed_seconds >= target_seconds
                 payload = {
                     "mycourseId": mycourse_id,
                     "docId": doc_id,
@@ -818,7 +855,7 @@ class Orchestrator:
                     return
 
                 update_number = 61
-                next_heartbeat_at += interval
+                next_heartbeat_at = time.monotonic() + interval
 
     def _download_segment(self, url: str) -> None:
         self.logger.info("下载视频分片：%s", url)
