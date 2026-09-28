@@ -902,7 +902,22 @@ class Orchestrator:
             ) from exc
 
     def _signal_relogin(self) -> None:
-        # 401 时同时写 stop，避免 watch 在重新登录完成前反复重启该账户。
+        # 401 时删除本地账户文件并同时写 stop，避免 watch 用旧 token 反复重启。
+        config = getattr(self, "config", None)
+        account_dir = getattr(config, "account_dir", None)
+        if account_dir is not None:
+            account_path = account_dir / f"{self.id_card}.account"
+            try:
+                account_path.unlink(missing_ok=True)
+            except OSError as exc:
+                self.logger.warning(
+                    "删除本地账户文件失败 %s：%s",
+                    account_path,
+                    exc,
+                )
+            else:
+                self.logger.info("已删除本地账户文件：%s", account_path)
+
         for suffix, content in (
             ("relogin", json.dumps({"attempts": 0}, ensure_ascii=False)),
             ("stop", ""),
@@ -917,9 +932,10 @@ class Orchestrator:
                     result.error,
                 )
         self.logger.info(
-            "视频返回 401，已写入重新登录信号和停止标记：%s",
+            "视频返回 401，已删除本地账户文件并写入重新登录信号，30 秒后继续：%s",
             self.id_card,
         )
+        time.sleep(30)
 
     def _handle_qr_verification(
         self,

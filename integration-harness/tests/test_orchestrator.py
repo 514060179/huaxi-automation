@@ -259,6 +259,26 @@ def test_find_course_group_returns_matching_group():
     )
 
 
+def test_find_course_group_returns_matching_flat_course_ids():
+    detail = {
+        "data": {
+            "taskInfo": {
+                "courseConfig": [
+                    {
+                        "_id": "config-1",
+                        "courseIds": ["course-a", "course-b"],
+                    }
+                ]
+            }
+        }
+    }
+
+    assert Orchestrator._find_course_group(None, detail, "course-b") == (
+        "config-1",
+        ["course-b"],
+    )
+
+
 def test_find_target_seconds_prefers_learned_total_time():
     course_detail = {
         "data": {
@@ -283,6 +303,39 @@ def test_find_target_seconds_falls_back_to_doc_duration():
     }
 
     assert Orchestrator._find_target_seconds(None, course_detail, "doc-id") == 888
+
+
+def test_find_learned_seconds_prefers_learned_time():
+    course_detail = {
+        "data": {
+            "mycourseInfo": {
+                "learned": {
+                    "doc-id": {"learnedTime": 2561, "lastTime": 0},
+                }
+            }
+        }
+    }
+
+    assert Orchestrator._find_learned_seconds(None, course_detail, "doc-id") == 2561
+
+
+def test_find_learned_seconds_falls_back_to_last_time_and_zero():
+    assert (
+        Orchestrator._find_learned_seconds(
+            None,
+            {"data": {"mycourseInfo": {"learned": {"doc-id": {"lastTime": 90}}}}},
+            "doc-id",
+        )
+        == 90
+    )
+    assert (
+        Orchestrator._find_learned_seconds(
+            None,
+            {"data": {"mycourseInfo": {"learned": {}}}},
+            "doc-id",
+        )
+        == 0
+    )
 
 
 def test_resolve_current_doc_id_prefers_doc_info():
@@ -492,7 +545,8 @@ def test_mark_account_stopped_writes_stop_key():
     assert orchestrator.oss_uploader.texts == [("hxacc/account/id-1/stop", "")]
 
 
-def test_signal_relogin_writes_signal():
+def test_signal_relogin_writes_signal(monkeypatch):
+    monkeypatch.setattr("integration_harness.orchestrator.time.sleep", lambda s: None)
     orchestrator = Orchestrator.__new__(Orchestrator)
     orchestrator.id_card = "id-1"
     orchestrator.logger = _DummyLogger()
@@ -504,6 +558,22 @@ def test_signal_relogin_writes_signal():
         ("hxacc/account/id-1/relogin", '{"attempts": 0}'),
         ("hxacc/account/id-1/stop", ""),
     ]
+
+
+def test_signal_relogin_deletes_local_account_file(tmp_path, monkeypatch):
+    monkeypatch.setattr("integration_harness.orchestrator.time.sleep", lambda s: None)
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.id_card = "id-1"
+    orchestrator.logger = _DummyLogger()
+    orchestrator.oss_uploader = _FakeOssUploader()
+    orchestrator.config = SimpleNamespace(account_dir=tmp_path)
+
+    account_path = tmp_path / "id-1.account"
+    account_path.write_text("{}", encoding="utf-8")
+
+    orchestrator._signal_relogin()
+
+    assert not account_path.exists()
 
 
 def test_post_json_signals_relogin_on_401():
