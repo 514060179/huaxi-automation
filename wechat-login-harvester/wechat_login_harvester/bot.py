@@ -82,6 +82,8 @@ def _help_text() -> str:
         "学习状态\n"
         "停止 身份证:440682198001010011\n"
         "恢复 身份证:440682198001010011\n"
+        "停止所有\n"
+        "恢复所有\n"
         "帮助"
     )
 
@@ -111,9 +113,13 @@ def parse_command(text: str) -> ParsedCommand:
         ("学习状态", "status"),
         ("状态", "status"),
         ("谁没在学习", "status"),
+        ("停止所有学习", "stop_all"),
+        ("停止所有", "stop_all"),
         ("停止", "stop"),
         ("停止学习", "stop"),
         ("stop", "stop"),
+        ("恢复所有学习", "resume_all"),
+        ("恢复所有", "resume_all"),
         ("恢复", "resume"),
         ("恢复学习", "resume"),
         ("继续", "resume"),
@@ -200,6 +206,12 @@ def parse_command(text: str) -> ParsedCommand:
                 error="恢复学习需要提供身份证，例如：恢复 身份证:440682198001010011",
             )
         return ParsedCommand(action="resume", target_id=id_values[0])
+
+    if action == "stop_all":
+        return ParsedCommand(action="stop_all")
+
+    if action == "resume_all":
+        return ParsedCommand(action="resume_all")
 
     return ParsedCommand(action="help")
 
@@ -356,6 +368,42 @@ def handle_text(store: UserStore, text: str, oss=None) -> str:
             except Exception as exc:
                 return f"恢复指令删除失败：{type(exc).__name__}: {exc}"
             return f"已发送恢复指令：{command.target_id}，学习任务将恢复"
+        if command.action == "stop_all":
+            if oss is None:
+                return "未配置 OSS，无法停止学习"
+            users = store.read()
+            if not users:
+                return "没有可停止的用户"
+            failed = []
+            for user in users:
+                id_card = str(user.get("id_card", "")).strip()
+                if not id_card:
+                    continue
+                try:
+                    oss.upload_text(_stop_key(id_card), "")
+                except Exception as exc:
+                    failed.append(f"{id_card}:{exc}")
+            if failed:
+                return "停止所有：部分失败，" + "；".join(failed)
+            return f"已发送停止指令：共 {len(users)} 个用户，学习任务将被停止"
+        if command.action == "resume_all":
+            if oss is None:
+                return "未配置 OSS，无法恢复学习"
+            users = store.read()
+            if not users:
+                return "没有可恢复的用户"
+            failed = []
+            for user in users:
+                id_card = str(user.get("id_card", "")).strip()
+                if not id_card:
+                    continue
+                try:
+                    oss.delete_object(_stop_key(id_card))
+                except Exception as exc:
+                    failed.append(f"{id_card}:{exc}")
+            if failed:
+                return "恢复所有：部分失败，" + "；".join(failed)
+            return f"已发送恢复指令：共 {len(users)} 个用户，学习任务将恢复"
     except (ValueError, json.JSONDecodeError) as exc:
         return f"操作失败：{exc}"
     return "未知命令，请发送“帮助”查看用法"

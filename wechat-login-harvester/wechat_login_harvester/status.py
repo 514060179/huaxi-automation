@@ -64,6 +64,11 @@ def build_statuses(
                 LearningStatus(name=name, id_card=id_card, state="finished", detail="已完成")
             )
             continue
+        if oss.object_exists(f"{prefix}daily_limit"):
+            statuses.append(
+                LearningStatus(name=name, id_card=id_card, state="daily_limit")
+            )
+            continue
         state, detail = _process_state(oss, id_card)
         statuses.append(
             LearningStatus(name=name, id_card=id_card, state=state, detail=detail)
@@ -81,6 +86,7 @@ def render_statuses(
         "not_learning": "未在学习",
         "finished": "已完成",
         "skipped": "已跳过",
+        "daily_limit": "已达今日上限",
     }
     lines: list[str] = []
     for item in statuses:
@@ -111,11 +117,12 @@ def summary_reply(
     finished = counts.get("finished", 0)
     not_learning = counts.get("not_learning", 0)
     skipped = counts.get("skipped", 0)
+    daily_limit = counts.get("daily_limit", 0)
     if only_not_learning:
         header = f"未在学习用户（共 {not_learning} 个）："
     else:
         header = (
             f"学习状态：学习中 {learning}，未在学习 {not_learning}，"
-            f"已完成 {finished}，已跳过 {skipped}"
+            f"已完成 {finished}，已跳过 {skipped}，已达今日上限 {daily_limit}"
         )
     return header + "\n" + body
