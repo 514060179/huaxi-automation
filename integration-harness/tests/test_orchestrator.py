@@ -62,6 +62,16 @@ def test_update_interval_too_short_message_is_detected():
     assert Orchestrator._is_update_interval_too_short("SUCCESS") is False
 
 
+def test_is_daily_limit_message_is_detected():
+    assert (
+        Orchestrator._is_daily_limit_message(
+            "您今天学习时长已经超过8小时，不继续累计时长！"
+        )
+        is True
+    )
+    assert Orchestrator._is_daily_limit_message("SUCCESS") is False
+
+
 def test_coerce_data_handles_string_and_missing_data():
     assert Orchestrator._coerce_data({"data": "unexpected"}) == {}
     assert Orchestrator._coerce_data({"data": {}}) == {}

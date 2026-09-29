@@ -810,6 +810,7 @@ class Orchestrator:
                 message = self._response_status_message(response)
                 if self._is_daily_limit_message(message):
                     notified = self._send_daily_limit_notification(message)
+                    self._mark_account_stopped()
                     raise _DailyLimitReached(
                         message,
                         already_notified=notified,
