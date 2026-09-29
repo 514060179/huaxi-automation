@@ -811,6 +811,7 @@ class Orchestrator:
                 if self._is_daily_limit_message(message):
                     notified = self._send_daily_limit_notification(message)
                     self._mark_account_stopped()
+                    self._mark_daily_limit()
                     raise _DailyLimitReached(
                         message,
                         already_notified=notified,
@@ -1265,6 +1266,16 @@ class Orchestrator:
         if not result.success:
             self.logger.warning(
                 "写入停止标记失败 %s：%s",
+                key,
+                result.error,
+            )
+
+    def _mark_daily_limit(self) -> None:
+        key = f"hxacc/account/{self.id_card}/daily_limit"
+        result = self.oss_uploader.upload_text(key, "")
+        if not result.success:
+            self.logger.warning(
+                "写入每日上限标记失败 %s：%s",
                 key,
                 result.error,
             )

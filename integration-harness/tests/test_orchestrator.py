@@ -555,6 +555,17 @@ def test_mark_account_stopped_writes_stop_key():
     assert orchestrator.oss_uploader.texts == [("hxacc/account/id-1/stop", "")]
 
 
+def test_mark_daily_limit_writes_marker():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.id_card = "id-1"
+    orchestrator.logger = _DummyLogger()
+    orchestrator.oss_uploader = _FakeOssUploader()
+
+    orchestrator._mark_daily_limit()
+
+    assert orchestrator.oss_uploader.texts == [("hxacc/account/id-1/daily_limit", "")]
+
+
 def test_signal_relogin_writes_signal(monkeypatch):
     monkeypatch.setattr("integration_harness.orchestrator.time.sleep", lambda s: None)
     orchestrator = Orchestrator.__new__(Orchestrator)
