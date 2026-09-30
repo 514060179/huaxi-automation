@@ -504,6 +504,7 @@ def _command_watch(config, notifier: WeChatNotifier | None) -> int:
             store=UserStore(config.user_file),
             stop_event=stop_event,
             oss=oss,
+            account_dir=config.account_dir,
         )
         print(
             f"已启动企业微信机器人长连接（监听 {config.user_file} 的 user 变更）"

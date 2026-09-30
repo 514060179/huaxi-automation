@@ -508,6 +508,19 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _dotenv_bool(path: Path, key: str, default: bool = False) -> bool:
+    if not path.exists():
+        return default
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        raw_key, value = line.split("=", 1)
+        if raw_key.strip() == key:
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
 def _daily_limit_key(id_card: str) -> str:
     return f"hxacc/account/{id_card}/daily_limit"
 
@@ -578,6 +591,8 @@ def _watch_accounts(account_dir: Path) -> int:
     expired_notified: set[str] = set()
     process_ttl_seconds = int(os.getenv("PROCESS_LEASE_SECONDS", "120"))
     last_renew: dict[str, float] = {}
+    global_env_path = _project_root() / ".env"
+    last_global_auto_next = getattr(config, "auto_next_course", False)
     print(f"开始监控 OSS hxacc/account/，本地账户目录 {account_dir}，扫描间隔 {interval}s")
 
     def process_key(id_card: str) -> str:
@@ -725,6 +740,16 @@ def _watch_accounts(account_dir: Path) -> int:
                     if worker_id in active_worker_ids
                     else -1
                 )
+
+                current_global_auto_next = _dotenv_bool(
+                    global_env_path,
+                    "AUTO_NEXT_COURSE",
+                    False,
+                )
+                if current_global_auto_next != last_global_auto_next:
+                    print("全局自动下一门配置变更，重启所有运行中的学习进程")
+                    stop_all()
+                    last_global_auto_next = current_global_auto_next
 
                 prefixes = uploader.list_prefixes("hxacc/account/")
                 current_ids = {

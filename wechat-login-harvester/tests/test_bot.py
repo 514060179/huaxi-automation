@@ -1,5 +1,6 @@
 import json
 
+from wechat_login_harvester import bot as bot_module
 from wechat_login_harvester.bot import (
     UserStore,
     clean_content,
@@ -40,6 +41,19 @@ def test_parse_update_command():
     assert command.values == {"id_card": "新号码", "name": "新名字"}
 
 
+def test_parse_set_auto_next_command():
+    command = parse_command("自动下一门 身份证:id-1 开关:true")
+    assert command.action == "set_auto_next"
+    assert command.target_id == "id-1"
+    assert command.values == {"auto_next_course": True}
+
+
+def test_parse_set_global_auto_next_command():
+    command = parse_command("全局自动下一门 开关:false")
+    assert command.action == "set_global_auto_next"
+    assert command.values == {"auto_next_course": False}
+
+
 def test_handle_text_round_trip(tmp_path):
     store = UserStore(tmp_path / "user")
     store.write(
@@ -70,6 +84,40 @@ def test_handle_text_round_trip(tmp_path):
     reply = handle_text(store, "查询")
     assert "陈丽梅" in reply
     assert "梁映芬" in reply
+
+
+def test_handle_text_set_auto_next_updates_account_file(tmp_path):
+    store = UserStore(tmp_path / "user")
+    store.write([{"name": "张三", "id_card": "id-1"}])
+    account_path = tmp_path / "id-1.account"
+    account_path.write_text(
+        json.dumps({"idCard": "id-1", "autoNextCourse": False}),
+        encoding="utf-8",
+    )
+
+    reply = handle_text(
+        store,
+        "自动下一门 身份证:id-1 开关:true",
+        account_dir=tmp_path,
+    )
+
+    assert "开启" in reply
+    payload = json.loads(account_path.read_text(encoding="utf-8"))
+    assert payload["autoNextCourse"] is True
+
+
+def test_handle_text_set_global_auto_next_updates_env(tmp_path, monkeypatch):
+    store = UserStore(tmp_path / "user")
+    store.write([{"name": "张三", "id_card": "id-1"}])
+    env_path = tmp_path / "integration-harness" / ".env"
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text("AUTO_NEXT_COURSE=false\n", encoding="utf-8")
+    monkeypatch.setattr(bot_module, "INTEGRATION_ENV_PATH", env_path)
+
+    reply = handle_text(store, "全局自动下一门 开关:true")
+
+    assert "开启" in reply
+    assert "AUTO_NEXT_COURSE=true" in env_path.read_text(encoding="utf-8")
 
 
 def test_handle_text_add_duplicate(tmp_path):

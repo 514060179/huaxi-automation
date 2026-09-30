@@ -20,9 +20,12 @@ logger = logging.getLogger(__name__)
 WEBSOCKET_URL = "wss://openws.work.weixin.qq.com"
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 HEARTBEAT_ENABLED = os.getenv("WECOM_BOT_HEARTBEAT", "1") not in {"0", "false", "no", "off"}
+INTEGRATION_ENV_PATH = Path(
+    os.getenv("INTEGRATION_ENV_FILE", "../integration-harness/.env")
+)
 
 _PAIR_RE = re.compile(
-    r"(?P<key>name|idcard|id_card|id|姓名|身份证|skip|是否跳过)"
+    r"(?P<key>name|idcard|id_card|id|姓名|身份证|skip|是否跳过|auto_next|auto_next_course|autonext|自动下一门|开关|是否自动下一门)"
     r"\s*[:：=]\s*"
     r"(?P<value>\"[^\"]*\"|'[^']*'|\S+)"
 )
@@ -40,6 +43,8 @@ def _key_name(key: str) -> str:
         return "name"
     if key in {"skip", "是否跳过"}:
         return "skip"
+    if key in {"auto_next", "auto_next_course", "autonext", "自动下一门", "开关", "是否自动下一门"}:
+        return "auto_next"
     return key
 
 
@@ -84,9 +89,11 @@ def _help_text() -> str:
         "恢复 身份证:440682198001010011\n"
         "停止所有\n"
         "恢复所有\n"
-        "自动下一门开关：\n"
-        "  全局 .env: AUTO_NEXT_COURSE=false\n"
-        "  单账号 .account: autoNextCourse=true\n"
+        "自动下一门 身份证:440682198001010011 开关:true\n"
+        "自动下一门 身份证:440682198001010011 开关:false\n"
+        "全局自动下一门 开关:true\n"
+        "全局自动下一门 开关:false\n"
+        "开关说明：全局 .env 用 AUTO_NEXT_COURSE；单账号用 autoNextCourse\n"
         "帮助"
     )
 
@@ -128,7 +135,10 @@ def parse_command(text: str) -> ParsedCommand:
         ("继续", "resume"),
         ("resume", "resume"),
         ("自动下一门开关", "help"),
-        ("自动下一门", "help"),
+        ("自动下一门", "set_auto_next"),
+        ("autonext", "set_auto_next"),
+        ("auto_next", "set_auto_next"),
+        ("全局自动下一门", "set_global_auto_next"),
         ("帮助", "help"),
         ("help", "help"),
     ):
@@ -211,6 +221,36 @@ def parse_command(text: str) -> ParsedCommand:
                 error="恢复学习需要提供身份证，例如：恢复 身份证:440682198001010011",
             )
         return ParsedCommand(action="resume", target_id=id_values[0])
+
+    if action == "set_auto_next":
+        if not id_values:
+            return ParsedCommand(
+                action="set_auto_next",
+                error="设置自动下一门需要提供身份证，例如：自动下一门 身份证:440682198001010011 开关:true",
+            )
+        auto_next_values = [value for key, value in pairs if key == "auto_next"]
+        if not auto_next_values:
+            return ParsedCommand(
+                action="set_auto_next",
+                error="设置自动下一门需要提供开关，例如：自动下一门 身份证:440682198001010011 开关:true",
+            )
+        return ParsedCommand(
+            action="set_auto_next",
+            target_id=id_values[0],
+            values={"auto_next_course": _as_bool(auto_next_values[0])},
+        )
+
+    if action == "set_global_auto_next":
+        auto_next_values = [value for key, value in pairs if key == "auto_next"]
+        if not auto_next_values:
+            return ParsedCommand(
+                action="set_global_auto_next",
+                error="设置全局自动下一门需要提供开关，例如：全局自动下一门 开关:true",
+            )
+        return ParsedCommand(
+            action="set_global_auto_next",
+            values={"auto_next_course": _as_bool(auto_next_values[0])},
+        )
 
     if action == "stop_all":
         return ParsedCommand(action="stop_all")
@@ -318,7 +358,61 @@ def _render_users(users: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def handle_text(store: UserStore, text: str, oss=None) -> str:
+def _set_account_auto_next(
+    account_dir: Path,
+    id_card: str,
+    enabled: bool,
+) -> str:
+    account_path = account_dir / f"{id_card}.account"
+    if not account_path.exists():
+        return f"未找到账号文件：{account_path}"
+    try:
+        payload = json.loads(account_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return f"账号文件读取失败：{type(exc).__name__}: {exc}"
+    payload["autoNextCourse"] = enabled
+    account_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return f"已设置 {id_card} 自动下一门：{'开启' if enabled else '关闭'}"
+
+
+def _set_global_auto_next(enabled: bool) -> str:
+    path = INTEGRATION_ENV_PATH
+    if not path.exists():
+        lines: list[str] = []
+    else:
+        lines = path.read_text(encoding="utf-8").splitlines()
+
+    value = "true" if enabled else "false"
+    updated = False
+    output: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            output.append(line)
+            continue
+        key, _ = stripped.split("=", 1)
+        if key.strip() == "AUTO_NEXT_COURSE":
+            output.append(f"AUTO_NEXT_COURSE={value}")
+            updated = True
+        else:
+            output.append(line)
+    if not updated:
+        output.append(f"AUTO_NEXT_COURSE={value}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(output) + "\n", encoding="utf-8")
+    return f"已设置全局自动下一门：{'开启' if enabled else '关闭'}"
+
+
+def handle_text(
+    store: UserStore,
+    text: str,
+    oss=None,
+    account_dir: Path | None = None,
+) -> str:
     """Execute a parsed command against the user store and return a reply."""
     command = parse_command(text)
     if command.error:
@@ -373,6 +467,20 @@ def handle_text(store: UserStore, text: str, oss=None) -> str:
             except Exception as exc:
                 return f"恢复指令删除失败：{type(exc).__name__}: {exc}"
             return f"已发送恢复指令：{command.target_id}，学习任务将恢复"
+        if command.action == "set_auto_next":
+            if account_dir is None:
+                return "未配置账号目录，无法修改自动下一门开关"
+            assert command.values is not None
+            return _set_account_auto_next(
+                account_dir,
+                command.target_id,
+                bool(command.values.get("auto_next_course", False)),
+            )
+        if command.action == "set_global_auto_next":
+            assert command.values is not None
+            return _set_global_auto_next(
+                bool(command.values.get("auto_next_course", False))
+            )
         if command.action == "stop_all":
             if oss is None:
                 return "未配置 OSS，无法停止学习"
@@ -436,6 +544,7 @@ class WeComBot:
         store: UserStore,
         stop_event: threading.Event,
         oss=None,
+        account_dir: Path | None = None,
         url: str = WEBSOCKET_URL,
     ) -> None:
         self.bot_id = bot_id
@@ -443,6 +552,7 @@ class WeComBot:
         self.store = store
         self.stop_event = stop_event
         self.oss = oss
+        self.account_dir = account_dir
         self.url = url
 
     def _ssl_context(self) -> ssl.SSLContext:
@@ -517,7 +627,12 @@ class WeComBot:
             if not content:
                 return
             logger.info("收到机器人消息：%s", content)
-            reply = handle_text(self.store, content, self.oss)
+            reply = handle_text(
+                self.store,
+                content,
+                self.oss,
+                self.account_dir,
+            )
             await self._reply(websocket, req_id, reply)
         elif cmd == "aibot_event_callback":
             # 忽略进入会话等事件，避免触发未配置的欢迎语
@@ -596,6 +711,7 @@ def start_bot_thread(
     store: UserStore,
     stop_event: threading.Event,
     oss=None,
+    account_dir: Path | None = None,
 ) -> threading.Thread:
     """Run the bot connection in a daemon thread so ``watch`` keeps working."""
 
@@ -609,6 +725,7 @@ def start_bot_thread(
                 store=store,
                 stop_event=stop_event,
                 oss=oss,
+                account_dir=account_dir,
             )
             loop.run_until_complete(bot.run())
         finally:

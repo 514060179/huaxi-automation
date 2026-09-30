@@ -64,7 +64,10 @@ cp .env.example .env
 学习状态
 停止 身份证:440682198001010011
 恢复 身份证:440682198001010011
-自动下一门开关
+自动下一门 身份证:440682198001010011 开关:true
+自动下一门 身份证:440682198001010011 开关:false
+全局自动下一门 开关:true
+全局自动下一门 开关:false
 帮助
 ```
 
@@ -78,7 +81,9 @@ cp .env.example .env
 - `学习状态`：列出全部用户的学习状态（学习中 / 未在学习 / 已完成 / 已跳过）。
 - `停止 身份证:xxx`：向 OSS 写入 `hxacc/account/{idCard}/stop` 标记，integration-harness 检测到后停止该学员的学习进程。
 - `恢复 身份证:xxx`：删除上述 `stop` 标记，学习任务重新恢复。
-- `自动下一门开关`：显示任务完成后的续学开关说明；全局在 integration-harness 的 `.env` 配置 `AUTO_NEXT_COURSE`，单账号在 `.account` 里配置 `autoNextCourse`。
+- `自动下一门 身份证:xxx 开关:true/false`：直接修改对应 `.account` 的 `autoNextCourse`；integration-harness 的 watch 检测到文件变化后会自动重启该账号进程。
+- `全局自动下一门 开关:true/false`：修改 integration-harness `.env` 的 `AUTO_NEXT_COURSE`，integration-harness 的 watch 检测到后重启全部运行中的学习进程。
+- `自动下一门开关`：显示续学开关说明；全局在 integration-harness 的 `.env` 配置 `AUTO_NEXT_COURSE`。
 - 中文冒号、英文冒号、`=` 均可作为分隔符。
 
 学习状态通过读取 OSS `hxacc/account/{idCard}/` 目录下的标记判断：
