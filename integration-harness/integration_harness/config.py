@@ -28,6 +28,7 @@ class Config:
     qr_page_port: int
     runs_dir: Path
     ssl_verify: bool
+    auto_next_course: bool
 
     @property
     def token_prefix(self) -> str:
@@ -77,7 +78,7 @@ def load_config(overrides: dict[str, str] | None = None) -> Config:
     account_dir = Path(
         values.get(
             "ACCOUNT_DIR",
-            "/Users/liuyingying/simon/work/automation/account",
+            "../account",
         )
     ).expanduser()
     if not account_dir.is_absolute():
@@ -118,4 +119,6 @@ def load_config(overrides: dict[str, str] | None = None) -> Config:
         runs_dir=runs_dir,
         ssl_verify=values.get("HXACC_SSL_VERIFY", "false").strip().lower()
         not in {"0", "false", "no", "off"},
+        auto_next_course=values.get("AUTO_NEXT_COURSE", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
     )

@@ -84,6 +84,9 @@ def _help_text() -> str:
         "恢复 身份证:440682198001010011\n"
         "停止所有\n"
         "恢复所有\n"
+        "自动下一门开关：\n"
+        "  全局 .env: AUTO_NEXT_COURSE=false\n"
+        "  单账号 .account: autoNextCourse=true\n"
         "帮助"
     )
 
@@ -124,6 +127,8 @@ def parse_command(text: str) -> ParsedCommand:
         ("恢复学习", "resume"),
         ("继续", "resume"),
         ("resume", "resume"),
+        ("自动下一门开关", "help"),
+        ("自动下一门", "help"),
         ("帮助", "help"),
         ("help", "help"),
     ):

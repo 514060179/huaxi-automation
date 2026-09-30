@@ -52,7 +52,7 @@ def load_config() -> Config:
     user_file = Path(
         os.getenv(
             "USER_FILE",
-            "/Users/liuyingying/simon/work/automation/wechat-login-harvester/user",
+            "user",
         )
     ).expanduser()
     if not user_file.is_absolute():
@@ -101,7 +101,7 @@ def load_config() -> Config:
     account_dir = Path(
         os.getenv(
             "ACCOUNT_DIR",
-            "/Users/liuyingying/simon/work/automation/account",
+            "../account",
         )
     ).expanduser()
     if not account_dir.is_absolute():

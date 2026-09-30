@@ -33,3 +33,30 @@ def test_flush_outbox_removes_delivered_messages(tmp_path):
 
     assert notifier.flush_outbox() == 1
     assert not outbox_path.exists()
+
+
+def test_send_task_completed_includes_courses_and_next_target():
+    notifier = WeChatNotifier("https://example.invalid", max_retries=1)
+    sent = []
+    notifier.send_markdown = lambda content: sent.append(content) or True
+
+    assert (
+        notifier.send_task_completed(
+            app_id="app-1",
+            token_prefix="token-prefix",
+            device_id="device-1",
+            session_id="session-1",
+            task_title="公需课",
+            completed_courses=["课程A", "课程B"],
+            next_target="专业课：课程C",
+            id_card="id-1",
+            name="张三",
+        )
+        is True
+    )
+
+    content = sent[0]
+    assert "任务：公需课" in content
+    assert "- 课程A" in content
+    assert "- 课程B" in content
+    assert "下一门：专业课：课程C" in content

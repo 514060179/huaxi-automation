@@ -18,7 +18,7 @@ from .accounts import Account, AccountLoadError, load_account_file, load_account
 from .client import ApiError, HxaccClient
 from .config import Config, load_config
 from .oss_upload import OssAccountUploader
-from .orchestrator import Orchestrator
+from .orchestrator import Orchestrator, _TaskCompletedAwaitResume
 from .storage import RunStore
 from .wechat import WeChatNotifier
 
@@ -29,6 +29,7 @@ DEFAULT_WECOM_WEBHOOK_URL = (
 )
 
 COMPENSATION_LOCK = threading.Lock()
+_AWAIT_RESUME_EXIT_CODE = 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--account-dir",
         default=os.getenv(
             "ACCOUNT_DIR",
-            "/Users/liuyingying/simon/work/automation/account",
+            "../account",
         ),
         help="Directory containing .account JSON files",
     )
@@ -211,6 +212,7 @@ def _run_one(
     id_card: str,
     name: str,
     replay: bool,
+    auto_next_course: bool,
     oss_uploader: OssAccountUploader,
 ) -> int:
     run_dir = config.runs_dir / session_id
@@ -238,11 +240,20 @@ def _run_one(
         id_card=id_card,
         name=name,
         replay=replay,
+        auto_next_course=auto_next_course,
         oss_uploader=oss_uploader,
     )
 
     try:
         orchestrator.run()
+    except _TaskCompletedAwaitResume as exc:
+        logger.info("任务已完成，等待恢复：%s", exc)
+        store.update_session_state(
+            session_id,
+            "awaiting_resume",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        return _AWAIT_RESUME_EXIT_CODE
     except Exception as exc:
         logger.exception("运行失败：%s", exc)
         if not getattr(exc, "already_notified", False):
@@ -335,8 +346,16 @@ def _run_prepared(task: _PreparedAccount) -> int:
             account.id_card,
             account.name,
             account.replay,
+            (
+                account.auto_next_course
+                if account.auto_next_course is not None
+                else config.auto_next_course
+            ),
             uploader,
         )
+        if result == _AWAIT_RESUME_EXIT_CODE:
+            print(f"{account.id_card} 任务已完成，等待恢复")
+            return 0
         if result != 0:
             _append_compensation(
                 account,
@@ -485,6 +504,14 @@ def _account_slot(id_card: str, slot_count: int) -> int:
     return int(digest, 16) % slot_count
 
 
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _daily_limit_key(id_card: str) -> str:
+    return f"hxacc/account/{id_card}/daily_limit"
+
+
 WORKERS_KEY = "hxacc/workers"
 
 
@@ -545,6 +572,7 @@ def _watch_accounts(account_dir: Path) -> int:
     log_dir = _project_root() / "runs" / "watch"
     log_dir.mkdir(parents=True, exist_ok=True)
     watched: dict[str, tuple[subprocess.Popen, object, object]] = {}
+    account_signatures: dict[str, str] = {}
     finished_notified: set[str] = set()
     stop_notified: set[str] = set()
     expired_notified: set[str] = set()
@@ -557,6 +585,24 @@ def _watch_accounts(account_dir: Path) -> int:
 
     def stop_key(id_card: str) -> str:
         return f"hxacc/account/{id_card}/stop"
+
+    def daily_limit_date(id_card: str) -> str | None:
+        key = _daily_limit_key(id_card)
+        if not uploader.object_exists(key):
+            return None
+        try:
+            return uploader.get_object_text(key).strip()
+        except Exception:
+            return ""
+
+    def stop_reason(id_card: str) -> str | None:
+        key = stop_key(id_card)
+        if not uploader.object_exists(key):
+            return None
+        try:
+            return uploader.get_object_text(key).strip()
+        except Exception:
+            return ""
 
     def notify_process_file_failure(action: str, key: str, error: str) -> None:
         notifier.send_markdown(
@@ -693,6 +739,23 @@ def _watch_accounts(account_dir: Path) -> int:
                         continue
 
                     prefix = f"hxacc/account/{id_card}/"
+                    limit_date = daily_limit_date(id_card)
+                    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+                    if limit_date is not None:
+                        if limit_date == today:
+                            if id_card in watched:
+                                stop_one(id_card)
+                            elif uploader.object_exists(process_key(id_card)):
+                                delete_process_file(id_card)
+                            continue
+                        if not uploader.delete_object(_daily_limit_key(id_card)).success:
+                            print(
+                                f"删除过期每日上限标记失败：{_daily_limit_key(id_card)}",
+                                file=sys.stderr,
+                            )
+                        if uploader.object_exists(stop_key(id_card)):
+                            uploader.delete_object(stop_key(id_card))
+
                     if uploader.object_exists(f"{prefix}finished"):
                         if id_card in watched:
                             stop_one(id_card)
@@ -716,7 +779,10 @@ def _watch_accounts(account_dir: Path) -> int:
                             stop_one(id_card)
                         elif uploader.object_exists(process_key(id_card)):
                             delete_process_file(id_card)
-                        if id_card not in stop_notified:
+                        if (
+                            stop_reason(id_card) != "task_completed"
+                            and id_card not in stop_notified
+                        ):
                             notifier.send_markdown(
                                 "\n".join(
                                     [
@@ -739,6 +805,15 @@ def _watch_accounts(account_dir: Path) -> int:
                             file=sys.stderr,
                         )
                         continue
+
+                    signature = _file_sha256(account_path)
+                    if (
+                        id_card in watched
+                        and account_signatures.get(id_card) != signature
+                    ):
+                        print(f"账户配置变更，重启学习：{id_card}")
+                        stop_one(id_card)
+                    account_signatures[id_card] = signature
 
                     if uploader.object_exists(process_key(id_card)):
                         if process_is_active(id_card):
@@ -904,15 +979,20 @@ def _resume_account(id_card: str) -> int:
         endpoint=config.oss_endpoint,
     )
     stop_key = f"hxacc/account/{id_card}/stop"
-    if not uploader.object_exists(stop_key):
+    limit_key = _daily_limit_key(id_card)
+    marker_keys = [
+        key for key in (stop_key, limit_key) if uploader.object_exists(key)
+    ]
+    if not marker_keys:
         print(f"账户 {id_card} 没有停止标记，无需恢复", file=sys.stderr)
         return 0
-    result = uploader.delete_object(stop_key)
-    if not result.success:
-        print(f"删除停止标记失败 {stop_key}: {result.error}", file=sys.stderr)
-        return 1
+    for key in marker_keys:
+        result = uploader.delete_object(key)
+        if not result.success:
+            print(f"删除停止标记失败 {key}: {result.error}", file=sys.stderr)
+            return 1
 
-    print(f"已删除停止标记 {stop_key}，账户 {id_card} 恢复学习")
+    print(f"已删除停止标记 {', '.join(marker_keys)}，账户 {id_card} 恢复学习")
     notifier = WeChatNotifier(config.wecom_webhook_url)
     notifier.send_markdown(
         "\n".join(

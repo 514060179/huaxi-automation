@@ -7,9 +7,11 @@ from types import SimpleNamespace
 
 from integration_harness.client import ApiError
 from integration_harness.orchestrator import (
+    CN_TZ,
     Orchestrator,
     _AuthVerificationFailed,
     _NoUnfinishedLearning,
+    _TaskCompletedAwaitResume,
 )
 
 
@@ -289,6 +291,81 @@ def test_find_course_group_returns_matching_flat_course_ids():
     )
 
 
+def test_default_course_target_uses_mycourse_course_list_first():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    detail = {
+        "data": {
+            "mytaskInfo": {
+                "courseList": [
+                    {"id": "selected-list", "courseIds": ["selected-course"]}
+                ]
+            },
+            "taskInfo": {
+                "courseConfig": [
+                    {"id": "config-list", "courseIds": ["unselected-course"]}
+                ]
+            },
+        }
+    }
+
+    assert orchestrator._default_course_target(detail) == (
+        "selected-list",
+        "selected-course",
+    )
+
+
+def test_default_course_target_falls_back_to_course_group():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    detail = {
+        "data": {
+            "mytaskInfo": {"courseList": []},
+            "taskInfo": {
+                "courseConfig": [
+                    {
+                        "id": "config-list",
+                        "courseGroup": [
+                            {"courseIds": ["group-course"]},
+                        ],
+                    }
+                ]
+            },
+        }
+    }
+
+    assert orchestrator._default_course_target(detail) == (
+        "config-list",
+        "group-course",
+    )
+
+
+def test_default_course_target_skips_finished_course():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    detail = {
+        "data": {
+            "mytaskInfo": {
+                "courseList": [],
+                "learned": {
+                    "finished-course": {"lp": 100},
+                    "unfinished-course": {"lp": 50},
+                },
+            },
+            "taskInfo": {
+                "courseConfig": [
+                    {
+                        "id": "config-list",
+                        "courseIds": ["finished-course", "unfinished-course"],
+                    }
+                ]
+            },
+        }
+    }
+
+    assert orchestrator._default_course_target(detail) == (
+        "config-list",
+        "unfinished-course",
+    )
+
+
 def test_find_target_seconds_prefers_learned_total_time():
     course_detail = {
         "data": {
@@ -563,7 +640,66 @@ def test_mark_daily_limit_writes_marker():
 
     orchestrator._mark_daily_limit()
 
-    assert orchestrator.oss_uploader.texts == [("hxacc/account/id-1/daily_limit", "")]
+    assert orchestrator.oss_uploader.texts == [
+        (
+            "hxacc/account/id-1/daily_limit",
+            datetime.now(CN_TZ).strftime("%Y-%m-%d"),
+        )
+    ]
+
+
+def test_on_task_completed_stops_and_notifies_when_not_auto_next():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.auto_next_course = False
+    orchestrator.config = SimpleNamespace(
+        app_id="app-1",
+        token_prefix="token-prefix",
+        device_id="device-1",
+    )
+    orchestrator.session_id = "session-1"
+    orchestrator.id_card = "id-1"
+    orchestrator.name = "张三"
+    orchestrator.logger = _DummyLogger()
+    orchestrator.oss_uploader = _FakeOssUploader()
+    sent = []
+    orchestrator.notifier = SimpleNamespace(
+        send_task_completed=lambda **kwargs: sent.append(kwargs) or True
+    )
+    orchestrator._task_completed_courses = lambda task_id, detail: ["课程A"]
+    orchestrator._next_task_target = lambda task_id: "专业课：课程B"
+
+    with pytest.raises(_TaskCompletedAwaitResume):
+        orchestrator._on_task_completed(
+            {"taskInfo": {"id": "task-1", "title": "公需课"}},
+            {},
+        )
+
+    assert sent[0]["completed_courses"] == ["课程A"]
+    assert sent[0]["next_target"] == "专业课：课程B"
+    assert orchestrator.oss_uploader.texts == [
+        ("hxacc/account/id-1/stop", "task_completed")
+    ]
+
+
+def test_next_task_target_skips_current_and_returns_next_unfinished():
+    orchestrator = Orchestrator.__new__(Orchestrator)
+    orchestrator.tasks = [
+        {"taskInfo": {"id": "task-1", "title": "公需课"}},
+        {"taskInfo": {"id": "task-2", "title": "专业课"}},
+    ]
+    orchestrator._get_task_detail = lambda task_id: {
+        "data": {
+            "mytaskInfo": {
+                "synced": 0,
+                "learned": {"course-x": {"lp": 50}},
+            }
+        }
+    }
+    orchestrator._course_titles = lambda task_id, detail, course_ids: {
+        "course-x": "课程X"
+    }
+
+    assert orchestrator._next_task_target("task-1") == "专业课：课程X"
 
 
 def test_signal_relogin_writes_signal(monkeypatch):

@@ -180,34 +180,41 @@ class WeChatNotifier:
         )
         return self.send_markdown(content)
 
-    def send_course_completed(
+    def send_task_completed(
         self,
         *,
         app_id: str,
         token_prefix: str,
         device_id: str,
         session_id: str,
-        course_title: str,
-        course_id: str,
+        task_title: str,
+        completed_courses: list[str],
+        next_target: str | None,
         id_card: str = "",
         name: str = "",
     ) -> bool:
-        content = "\n".join(
+        lines = [
+            "✅ 任务已完成",
+            "",
+            f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+            f"appId：{app_id}",
+            f"idCard：{id_card}",
+            f"姓名：{name}",
+            f"token前缀：{token_prefix}",
+            f"deviceId：{device_id}",
+            f"会话ID：{session_id}",
+            f"任务：{task_title}",
+            "",
+            "已完成课程：",
+        ]
+        lines.extend(f"- {course}" for course in completed_courses)
+        lines.extend(
             [
-                "✅ 课程学习完成",
                 "",
-                f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-                f"appId：{app_id}",
-                f"idCard：{id_card}",
-                f"姓名：{name}",
-                f"token前缀：{token_prefix}",
-                f"deviceId：{device_id}",
-                f"会话ID：{session_id}",
-                f"课程：{course_title}",
-                f"courseId：{course_id}",
+                f"下一门：{next_target or '无剩余课程，等待最终校验'}",
             ]
         )
-        return self.send_markdown(content)
+        return self.send_markdown("\n".join(lines))
 
     def send_time_window_blocked(
         self,

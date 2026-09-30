@@ -17,6 +17,7 @@ def test_load_account_file_reads_filename_as_id_card(tmp_path):
                 "idCard": "440682199309042146",
                 "name": "张三",
                 "replay": True,
+                "autoNextCourse": False,
                 "appId": "app-1",
                 "token": "token-1",
                 "deviceId": "device-1",
@@ -31,9 +32,30 @@ def test_load_account_file_reads_filename_as_id_card(tmp_path):
     assert account.id_card == "440682199309042146"
     assert account.name == "张三"
     assert account.replay is True
+    assert account.auto_next_course is False
     assert account.app_id == "app-1"
     assert account.token == "token-1"
     assert account.device_id == "device-1"
+
+
+def test_load_account_file_auto_next_course_defaults_to_none(tmp_path):
+    path = tmp_path / "id.account"
+    path.write_text(
+        json.dumps(
+            {
+                "name": "张三",
+                "appId": "app-1",
+                "token": "token-1",
+                "deviceId": "device-1",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    account = load_account_file(path)
+
+    assert account.auto_next_course is None
 
 
 def test_load_account_file_rejects_missing_fields(tmp_path):

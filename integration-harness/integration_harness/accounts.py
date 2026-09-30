@@ -10,6 +10,7 @@ class Account:
     id_card: str
     name: str
     replay: bool
+    auto_next_course: bool | None
     app_id: str
     token: str
     device_id: str
@@ -45,6 +46,7 @@ def load_account_file(path: Path) -> Account:
     device_id = payload.get("deviceId") or payload.get("device_id")
     name = payload.get("name")
     replay = bool(payload.get("replay", False))
+    auto_next_course = _optional_bool(payload.get("autoNextCourse"))
     id_card = payload.get("idCard") or path.stem
     if not app_id or not token or not device_id or not name:
         raise AccountLoadError(
@@ -55,6 +57,7 @@ def load_account_file(path: Path) -> Account:
         id_card=str(id_card),
         name=str(name),
         replay=replay,
+        auto_next_course=auto_next_course,
         app_id=str(app_id),
         token=str(token),
         device_id=str(device_id),
@@ -64,3 +67,13 @@ def load_account_file(path: Path) -> Account:
 
 def load_accounts(account_dir: Path) -> list[Account]:
     return [load_account_file(path) for path in discover_account_files(account_dir)]
+
+
+def _optional_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)

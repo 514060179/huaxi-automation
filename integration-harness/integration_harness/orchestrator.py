@@ -57,6 +57,12 @@ class _NoUnfinishedLearning(RuntimeError):
     pass
 
 
+class _TaskCompletedAwaitResume(RuntimeError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.already_notified = True
+
+
 class _DailyLimitReached(RuntimeError):
     def __init__(self, message: str, *, already_notified: bool) -> None:
         super().__init__(message)
@@ -84,6 +90,7 @@ class Orchestrator:
         id_card: str,
         name: str,
         replay: bool,
+        auto_next_course: bool,
         oss_uploader: OssAccountUploader,
     ) -> None:
         self.config = config
@@ -95,15 +102,18 @@ class Orchestrator:
         self.id_card = id_card
         self.name = name
         self.replay = replay
+        self.auto_next_course = auto_next_course
         self.oss_uploader = oss_uploader
         self.qr_state: QRPageState | None = None
         self.qr_server_handle: QRServerHandle | None = None
+        self.tasks: list[dict[str, Any]] = []
 
     def run(self) -> None:
         self._set_state("starting")
         self.logger.info("开始正常路径集成测试")
 
         tasks = self._select_tasks()
+        self.tasks = tasks
         total = len(tasks)
         self.logger.info("接口返回 %s 个任务，将逐个处理", total)
 
@@ -193,8 +203,11 @@ class Orchestrator:
                 forced_course_list_id, course_id = self._cert_watch_target(task_id)
                 forced_watch = bool(course_id)
                 if not forced_watch:
+                    forced_course_list_id, course_id = self._default_course_target(detail)
+                    forced_watch = bool(course_id)
+                if not forced_watch:
                     self.logger.warning(
-                        "任务未同步，但无法从 getTaskCert 定位待观看课程：%s",
+                        "任务未同步，但无法从 getTaskCert 或任务配置定位待观看课程：%s",
                         task_id,
                     )
                     break
@@ -238,14 +251,10 @@ class Orchestrator:
                         "小节完成后检测到任务已同步完成（synced=1）：%s",
                         task_id,
                     )
+                    detail = self._get_task_detail(task_id)
+                    self._on_task_completed(task, detail)
                     break
                 detail = self._get_task_detail(task_id)
-                if not forced_watch:
-                    self._notify_course_completed_if_needed(
-                        detail,
-                        course_id=course_id,
-                        course_title=course_title,
-                    )
             except _NoUnfinishedLearning as exc:
                 skipped_course_ids.add(course_id)
                 self.logger.info("课程 %s 跳过：%s", course_id, exc)
@@ -270,6 +279,8 @@ class Orchestrator:
         task_id: str,
         course_list_id: str,
         course_ids: list[str],
+        *,
+        page_size: int = 30,
     ) -> dict[str, Any]:
         return self._post_json(
             "/api/mytask/getTaskCourseList",
@@ -278,7 +289,7 @@ class Orchestrator:
                 "courseListId": course_list_id,
                 "courseIds": course_ids,
                 "page": 1,
-                "pageSize": 30,
+                "pageSize": page_size,
                 "appId": self.config.app_id,
             },
             event_type="getTaskCourseList",
@@ -484,48 +495,145 @@ class Orchestrator:
                 return course_id
         return ""
 
-    def _is_course_completed(
+    def _on_task_completed(
         self,
+        task: dict[str, Any],
         detail: dict[str, Any],
-        course_id: str,
-    ) -> bool:
+    ) -> None:
+        if self.auto_next_course:
+            return
+
+        task_info = task.get("taskInfo") or {}
+        task_id = task_info.get("id")
+        task_title = task_info.get("title") or "<未命名任务>"
+        completed_courses = self._task_completed_courses(task_id, detail)
+        next_target = self._next_task_target(task_id)
+
+        ok = self.notifier.send_task_completed(
+            app_id=self.config.app_id,
+            token_prefix=self.config.token_prefix,
+            device_id=self.config.device_id,
+            session_id=self.session_id,
+            task_title=task_title,
+            completed_courses=completed_courses,
+            next_target=next_target,
+            id_card=self.id_card,
+            name=self.name,
+        )
+        if not ok:
+            self.logger.warning("任务完成的企业微信推送失败")
+
+        if next_target:
+            self._mark_account_stopped("task_completed")
+            raise _TaskCompletedAwaitResume(
+                f"任务“{task_title}”已完成，等待人工恢复继续下一门"
+            )
+
+    def _task_completed_courses(
+        self,
+        task_id: str,
+        detail: dict[str, Any],
+    ) -> list[str]:
         learned = (
             detail.get("data", {})
             .get("mytaskInfo", {})
             .get("learned")
             or {}
         )
-        state = learned.get(course_id)
-        if not isinstance(state, dict):
-            return False
-        try:
-            return int(state.get("lp", 0)) >= 100
-        except (TypeError, ValueError):
-            return False
+        completed_ids: list[str] = []
+        for course_id, state in learned.items():
+            if not isinstance(state, dict):
+                continue
+            try:
+                progress = int(state.get("lp", 0))
+            except (TypeError, ValueError):
+                continue
+            if progress >= 100:
+                completed_ids.append(str(course_id))
+        if not completed_ids:
+            return []
 
-    def _notify_course_completed_if_needed(
+        titles = self._course_titles(task_id, detail, completed_ids)
+        return [titles.get(course_id, course_id) for course_id in completed_ids]
+
+    def _course_titles(
         self,
+        task_id: str,
         detail: dict[str, Any],
-        *,
-        course_id: str,
-        course_title: str,
-    ) -> None:
-        if not self._is_course_completed(detail, course_id):
-            return
-        ok = self.notifier.send_course_completed(
-            app_id=self.config.app_id,
-            token_prefix=self.config.token_prefix,
-            device_id=self.config.device_id,
-            session_id=self.session_id,
-            course_title=course_title,
-            course_id=course_id,
-            id_card=self.id_card,
-            name=self.name,
-        )
-        if not ok:
-            self.logger.warning("课程完成的企业微信推送失败")
-        else:
-            self.logger.info("已推送课程完成通知：%s", course_title)
+        course_ids: list[str],
+    ) -> dict[str, str]:
+        if not course_ids:
+            return {}
+
+        task_info = detail.get("data", {}).get("taskInfo") or {}
+        by_config: dict[str, list[str]] = {}
+        for course_config in task_info.get("courseConfig") or []:
+            if not isinstance(course_config, dict):
+                continue
+            course_list_id = course_config.get("id") or course_config.get("_id")
+            if not course_list_id:
+                continue
+            config_course_ids = {
+                str(course_id)
+                for course_id in course_config.get("courseIds") or []
+            }
+            for group in course_config.get("courseGroup") or []:
+                if isinstance(group, dict):
+                    config_course_ids.update(
+                        str(course_id) for course_id in group.get("courseIds") or []
+                    )
+            matched = [cid for cid in course_ids if cid in config_course_ids]
+            if matched:
+                by_config[str(course_list_id)] = matched
+
+        titles: dict[str, str] = {}
+        for course_list_id, ids in by_config.items():
+            response = self._get_course_list(
+                task_id,
+                course_list_id,
+                ids,
+                page_size=max(30, len(ids)),
+            )
+            items = response.get("data", {}).get("list") or []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                course_info = item.get("courseInfo") or {}
+                if not isinstance(course_info, dict):
+                    continue
+                course_id = course_info.get("id") or course_info.get("_id")
+                title = course_info.get("title")
+                if course_id and title:
+                    titles[str(course_id)] = str(title)
+        return titles
+
+    def _next_task_target(self, current_task_id: str) -> str | None:
+        seen_current = False
+        for task in self.tasks:
+            task_info = task.get("taskInfo") or {}
+            task_id = task_info.get("id")
+            if not task_id:
+                continue
+            if not seen_current:
+                if str(task_id) == str(current_task_id):
+                    seen_current = True
+                continue
+
+            detail = self._get_task_detail(str(task_id))
+            mytask_info = detail.get("data", {}).get("mytaskInfo") or {}
+            if mytask_info.get("synced") in (1, "1", True):
+                continue
+
+            course_id = self._next_unfinished_course_id(detail)
+            if not course_id:
+                _, course_id = self._cert_watch_target(str(task_id))
+            if not course_id:
+                _, course_id = self._default_course_target(detail)
+            if course_id:
+                titles = self._course_titles(str(task_id), detail, [course_id])
+                course_title = titles.get(course_id, course_id)
+                return f"{task_info.get('title') or '<未命名任务>'}：{course_title}"
+        return None
 
     def _find_course_group(
         self,
@@ -810,7 +918,6 @@ class Orchestrator:
                 message = self._response_status_message(response)
                 if self._is_daily_limit_message(message):
                     notified = self._send_daily_limit_notification(message)
-                    self._mark_account_stopped()
                     self._mark_daily_limit()
                     raise _DailyLimitReached(
                         message,
@@ -1260,9 +1367,9 @@ class Orchestrator:
     def _is_learned_complete(cls, data: dict[str, Any]) -> bool:
         return cls._data_learned_status(data) == 2
 
-    def _mark_account_stopped(self) -> None:
+    def _mark_account_stopped(self, content: str = "") -> None:
         key = f"hxacc/account/{self.id_card}/stop"
-        result = self.oss_uploader.upload_text(key, "")
+        result = self.oss_uploader.upload_text(key, content)
         if not result.success:
             self.logger.warning(
                 "写入停止标记失败 %s：%s",
@@ -1272,13 +1379,71 @@ class Orchestrator:
 
     def _mark_daily_limit(self) -> None:
         key = f"hxacc/account/{self.id_card}/daily_limit"
-        result = self.oss_uploader.upload_text(key, "")
+        result = self.oss_uploader.upload_text(
+            key,
+            datetime.now(CN_TZ).strftime("%Y-%m-%d"),
+        )
         if not result.success:
             self.logger.warning(
                 "写入每日上限标记失败 %s：%s",
                 key,
                 result.error,
             )
+
+    def _default_course_target(
+        self,
+        detail: dict[str, Any],
+    ) -> tuple[str, str]:
+        mytask_info = detail.get("data", {}).get("mytaskInfo") or {}
+        course_list = mytask_info.get("courseList") or []
+        if isinstance(course_list, list):
+            for entry in course_list:
+                if not isinstance(entry, dict):
+                    continue
+                course_list_id = entry.get("id") or entry.get("_id")
+                course_ids = entry.get("courseIds") or []
+                if course_list_id and course_ids:
+                    return str(course_list_id), str(course_ids[0])
+
+        task_info = detail.get("data", {}).get("taskInfo") or {}
+        course_configs = task_info.get("courseConfig") or []
+        learned = mytask_info.get("learned") or {}
+
+        def is_finished(course_id: str) -> bool:
+            state = learned.get(course_id)
+            if not isinstance(state, dict):
+                return False
+            try:
+                return int(state.get("lp", 0)) >= 100
+            except (TypeError, ValueError):
+                return False
+
+        for course_config in course_configs:
+            if not isinstance(course_config, dict):
+                continue
+            course_list_id = course_config.get("id") or course_config.get("_id")
+            if not course_list_id:
+                continue
+            flat_course_ids = course_config.get("courseIds") or []
+            unfinished = [
+                str(course_id)
+                for course_id in flat_course_ids
+                if not is_finished(str(course_id))
+            ]
+            if unfinished:
+                return str(course_list_id), unfinished[0]
+            for group in course_config.get("courseGroup") or []:
+                if not isinstance(group, dict):
+                    continue
+                group_course_ids = group.get("courseIds") or []
+                unfinished = [
+                    str(course_id)
+                    for course_id in group_course_ids
+                    if not is_finished(str(course_id))
+                ]
+                if unfinished:
+                    return str(course_list_id), unfinished[0]
+        return "", ""
 
     def _notify_verification_failed(
         self,

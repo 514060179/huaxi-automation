@@ -24,7 +24,7 @@ pip install -e ".[test]"
 运行所需账户从外部目录加载：
 
 ```text
-/Users/liuyingying/simon/work/automation/account
+../account
 ```
 
 目录下每个 `.account` 文件代表一个用户，文件名为身份证号，内容为 JSON：
@@ -34,6 +34,7 @@ pip install -e ".[test]"
   "idCard": "440682198210063620",
   "name": "张三",
   "replay": false,
+  "autoNextCourse": false,
   "appId": "60101caa0874ec17548b9822",
   "token": "your-token",
   "deviceId": "your-device-id"
@@ -56,7 +57,8 @@ cp .env.example .env
 - `RUN_START_HOUR` / `RUN_END_HOUR`：允许运行时间窗口，默认 5 点到 22 点
 - `WECOM_WEBHOOK_URL`：企业微信机器人 Webhook 地址
 - `WECOM_NOTIFY_TAG`：企业微信通知前缀，默认 `【integration-harness】`
-- `ACCOUNT_DIR`：账户目录，默认 `/Users/liuyingying/simon/work/automation/account`
+- `AUTO_NEXT_COURSE`：任务完成后是否自动继续下一门；默认 `false`
+- `ACCOUNT_DIR`：账户目录，默认 `../account`（相对当前项目目录）
 - `OSS_BUCKET` / `OSS_ACCESS_KEY_ID` / `OSS_ACCESS_KEY_SECRET` / `OSS_ENDPOINT`：阿里云 OSS 上传配置
 - `HXACC_SSL_VERIFY`：是否校验真实后端 TLS 证书；当前环境默认设为 `false`，仅在无法验证本地代理证书时使用
 
@@ -72,7 +74,7 @@ cp .env.example .env
 
 ```bash
 .venv/bin/python -m integration_harness run \
-  --account-dir /Users/liuyingying/simon/work/automation/account
+  --account-dir ../account
 ```
 
 多个 `.account` 文件会并行执行，默认最多 3 个并发；可通过 `--max-workers` 调整：
@@ -109,7 +111,7 @@ runs/.compensation_queue.jsonl
 
 ```bash
 .venv/bin/python -m integration_harness watch \
-  --account-dir /Users/liuyingying/simon/work/automation/account
+  --account-dir ../account
 ```
 
 扫描逻辑：
@@ -120,6 +122,7 @@ runs/.compensation_queue.jsonl
 - `.process` 文件带租约信息，`PROCESS_LEASE_SECONDS` 默认 120 秒；过期后会自动清理并重新接管，避免设备异常退出后永久跳过。
 - OSS 请求连接超时默认 10 秒；单次扫描失败不会退出 watch，会等待下一轮重试，连续失败 3 次会推送企业微信。
 - 否则读取本地 `{idCard}.account`，如果 `tokenExpiresAt` 已过期，推送“请重新获取 token”到企业微信。
+- 每轮会比对本地 `{idCard}.account` 文件内容；配置变更后自动重启该账户的子进程，`autoNextCourse` 等单账号覆盖无需重启 watch。
 - 如果未过期，则创建 `{idCard}.process` 后启动对应的课程学习子进程；进程结束或被杀前会删除该标记文件，删除失败会推送企业微信。
 
 扫描间隔通过 `ACCOUNT_WATCH_INTERVAL_SECONDS` 配置，默认 2 秒。子进程日志写入：
@@ -209,7 +212,8 @@ watch 在重新登录完成前反复重启该账户），由 wechat-login-harves
 
 - 视频下载重试耗尽或运行异常
 - 触发“您今天学习时长已经超过8小时，不继续累计时长！”
-- 单个课程学习完成
+- 任务完成后（`AUTO_NEXT_COURSE=false` 时）列出已完成课程和下一门
+- 账户全部课程完成后推送最终完成汇总
 - 当前时间不在允许运行窗口
 
 企业微信推送失败时会写入本地 outbox：
@@ -219,6 +223,39 @@ runs/.wecom_outbox.jsonl
 ```
 
 下一次运行启动时会先尝试补发 outbox 中未发送成功的通知。
+
+## 企业微信使用说明
+
+项目已经复用同一个企业微信群机器人，不需要新增机器人。只需在 `.env` 中配置：
+
+```bash
+WECOM_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=已有机器人key
+WECOM_NOTIFY_TAG=【integration-harness】
+```
+
+`AUTO_NEXT_COURSE` 和 `.account` 里的 `autoNextCourse` 一起决定任务完成后的行为：
+
+| 配置 | 行为 |
+| --- | --- |
+| 全局 `AUTO_NEXT_COURSE=false`（默认） | 任务完成后发送企业微信清单，写 `stop`，等人工 `resume` |
+| 全局 `AUTO_NEXT_COURSE=true` | 不逐任务通知，自动继续下一门；全部完成后发最终汇总 |
+| 账号内 `autoNextCourse` 覆盖全局 | 单个账号可单独切换模式，watch 检测到文件变化后自动重启该账号进程 |
+
+任务完成通知示例：
+
+```text
+✅ 任务已完成
+任务：广东省2026年度继续教育-公需课
+已完成课程：
+- 人工智能赋能高质量发展
+下一门：专业课：新《会计法》对财务人员的影响
+```
+
+人工恢复命令：
+
+```bash
+.venv/bin/python -m integration_harness resume --id-card 440682198210063620
+```
 
 ## 运行产物
 

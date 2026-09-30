@@ -34,6 +34,18 @@ def test_load_config_reads_dotenv(tmp_path, monkeypatch):
     assert config.token_prefix == "secret-token"
     assert config.device_id == "device-id"
     assert config.video_quality == "FD"
+    assert config.auto_next_course is False
+
+
+def test_load_config_reads_auto_next_course_override(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HXACC_TOKEN", "secret-token")
+    monkeypatch.setenv("HXACC_DEVICE_ID", "device-id")
+    monkeypatch.setenv("AUTO_NEXT_COURSE", "true")
+
+    config = load_config()
+
+    assert config.auto_next_course is True
 
 
 def test_config_runs_dir_is_absolute(tmp_path, monkeypatch):

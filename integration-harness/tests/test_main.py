@@ -12,6 +12,7 @@ from integration_harness.main import (
     _account_file_paths,
     _append_compensation,
     _compensation_sources,
+    _daily_limit_key,
     _ensure_account_file,
     _is_in_run_window,
     _oss_worker_ids,
@@ -145,6 +146,7 @@ def _account(tmp_path: Path, name: str) -> Account:
         id_card=name,
         name=name,
         replay=False,
+        auto_next_course=None,
         app_id="app-1",
         token="token-1",
         device_id="device-1",
@@ -196,7 +198,7 @@ def test_single_account_command(tmp_path):
     assert command[-2:] == ["--account-file", str(account)]
 
 
-def test_resume_account_deletes_stop_marker_and_notifies(monkeypatch):
+def test_resume_account_deletes_stop_and_daily_limit_markers_and_notifies(monkeypatch):
     class FakeUploader:
         def __init__(self, **kwargs):
             self.deleted = []
@@ -242,7 +244,10 @@ def test_resume_account_deletes_stop_marker_and_notifies(monkeypatch):
     result = _resume_account("id-1")
 
     assert result == 0
-    assert uploader.deleted == ["hxacc/account/id-1/stop"]
+    assert uploader.deleted == [
+        "hxacc/account/id-1/stop",
+        _daily_limit_key("id-1"),
+    ]
 
 
 def test_account_slot_is_stable_and_in_range():
@@ -350,3 +355,92 @@ def test_watch_accounts_starts_and_stops_child(tmp_path, monkeypatch):
     assert len(_FakePopen.instances) == 1
     assert _FakePopen.instances[0].terminated is True
     assert _FakePopen.instances[0].waited is True
+
+
+def test_watch_accounts_restarts_child_when_account_file_changes(
+    tmp_path, monkeypatch
+):
+    account = tmp_path / "id.account"
+    account.write_text(
+        '{"appId":"app","token":"token","deviceId":"device","name":"张三","tokenExpiresAt":4102444800}',
+        encoding="utf-8",
+    )
+
+    class FakeUploader:
+        def list_prefixes(self, prefix):
+            return ["hxacc/account/id/"]
+
+        def object_exists(self, key):
+            return False
+
+        def upload_text(self, key, content=""):
+            return SimpleNamespace(key=key, success=True, error=None)
+
+        def delete_object(self, key):
+            return SimpleNamespace(key=key, success=True, error=None)
+
+    class FakeNotifier:
+        def __init__(self, *args, **kwargs):
+            self.sent = []
+
+        def send_markdown(self, content):
+            self.sent.append(content)
+            return True
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "integration_harness.main._project_root",
+        lambda: tmp_path,
+    )
+    monkeypatch.setattr(
+        "integration_harness.main.load_config",
+        lambda overrides=None: SimpleNamespace(
+            wecom_webhook_url="https://example.com/hook",
+            runs_dir=tmp_path / "runs",
+            oss_bucket="bucket",
+            oss_access_key_id="key",
+            oss_access_key_secret="secret",
+            oss_endpoint="https://example.com",
+        ),
+    )
+    monkeypatch.setattr(
+        "integration_harness.main.OssAccountUploader",
+        lambda **kwargs: FakeUploader(),
+    )
+    monkeypatch.setattr(
+        "integration_harness.main.WeChatNotifier",
+        FakeNotifier,
+    )
+    monkeypatch.setattr(
+        "integration_harness.main._single_account_command",
+        lambda path: ["fake-run", str(path)],
+    )
+    monkeypatch.setattr(
+        "integration_harness.main.subprocess.Popen",
+        _FakePopen,
+    )
+
+    calls = 0
+
+    def change_then_interrupt(_):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            account.write_text(
+                '{"appId":"app","token":"new-token","deviceId":"device","name":"张三","tokenExpiresAt":4102444800}',
+                encoding="utf-8",
+            )
+            return
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("integration_harness.main.time.sleep", change_then_interrupt)
+    _FakePopen.instances.clear()
+
+    result = _watch_accounts(tmp_path)
+
+    assert result == 0
+    assert len(_FakePopen.instances) == 2
+    assert _FakePopen.instances[0].terminated is True
+    assert _FakePopen.instances[1].terminated is True
